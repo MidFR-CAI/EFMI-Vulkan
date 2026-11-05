@@ -287,12 +287,15 @@ Override Identify(Runtime* rt, int componentId, const uint8_t* config, uint64_t 
         if (!found) return Override::kOriginal;  // The pool is full: not tracked.
         *found = Runtime::SpatialSlot{};
         found->used = true;
-        memcpy(found->position, p, sizeof(p));
     } else if (expired(*found)) {
         // pool_expiration_reset_elements: its value back to the default (0).
         found->state = Runtime::SpatialSlot::kEmpty;
         found->componentBits = 0;
     }
+    // The slot follows its object: the position it was last seen at. Kept where first seen, a
+    // moving character left its slot every 0.375 m and came back as a new object, skipped
+    // for a frame and with no bones yet: invisible for a frame, again and again.
+    memcpy(found->position, p, sizeof(p));
     found->lastRead = std::max(found->lastRead, frame);  // pool_expiration_refresh_on_read.
     *slot = static_cast<uint32_t>(found - rt->spatial);
     switch (found->state) {
