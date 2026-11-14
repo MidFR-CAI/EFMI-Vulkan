@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "autofix.h"
 #include "common.h"
 #include "efmi.h"
 #include "efmimod.h"
@@ -104,6 +105,7 @@ struct Runtime {
     std::map<std::string, int> toggles;
     std::vector<char> keyDown;  // Input thread only.
     std::atomic<uint64_t> lastDrawFrame{0};
+    uint64_t fingerprint = 0;  // Its ini's and files' sizes and times: unchanged, a reload keeps it.
 };
 
 struct Target {
@@ -112,13 +114,17 @@ struct Target {
 };
 
 std::atomic<bool> g_loaded{false};
-std::vector<Runtime*>* g_runtimes = new std::vector<Runtime*>();
-std::unordered_map<uint32_t, std::vector<Target>>* g_byHash = new std::unordered_map<uint32_t, std::vector<Target>>();
+// Replaced as a whole by a reload (Shift+F10). The old ones are never freed: a render thread
+// may be inside one, and command buffers in flight use the mods' GPU buffers.
+using ByHash = std::unordered_map<uint32_t, std::vector<Target>>;
+std::atomic<const std::vector<Runtime*>*> g_runtimes{new std::vector<Runtime*>()};
+std::atomic<const ByHash*> g_byHash{new ByHash()};
+std::mutex g_reloadMu;  // One load at a time.
 
 std::mutex g_logMu;
 std::set<std::tuple<const Runtime*, size_t, int>>* g_logged = new std::set<std::tuple<const Runtime*, size_t, int>>();
 
-enum Reason { kGpuPosed, kInstanced, kStride, kNoBuffer, kNoPipeline, kReplaced, kTextures, kOtherBones, kNoBones, kRingFull, kSkeleton, kRecords, kUnidentified, kTrimming };
+enum Reason { kGpuPosed, kInstanced, kStride, kNoBuffer, kNoPipeline, kReplaced, kTextures, kOtherBones, kNoBones, kRingFull, kSkeleton, kRecords, kUnidentified, kTrimming, kSlots, kEffectPass };
 
 void LogOnce(const Runtime* rt, size_t component, Reason reason, const char* fmt, ...) {
     // Called on every matched draw: each thread skips what it has seen without a lock.
@@ -251,11 +257,20 @@ constexpr float kSpatialRadius = 3 * 0.125f;
 constexpr uint64_t kIdentificationTimeout = 255;  // $identification_timeout_frames.
 constexpr uint64_t kSpatialExpireFrames = 4;  // pool_expiration_timeout_frames 1, in presents (see Identify).
 
+// An object the mod owned, unseen for longer than kSpatialExpireFrames but at most this, is
+// still the mod's when it is back.
+constexpr uint64_t kSpatialForgetFrames = 240;
+
 enum class Override { kSkip, kOriginal, kCustom };  // $enum_override_type_*.
 std::atomic<uint64_t> g_identified[3]{};  // Instances skipped, left to the game, drawn by the mod.
+// New objects: no known one at its place; a known one new again after a time unseen; a known
+// one of the mod's back after a short time or moved at once, kept.
+std::atomic<uint64_t> g_newObjects[3]{};
+std::atomic<uint64_t> g_newObjectsLogged{0};
+std::atomic<uint64_t> g_effectDraws{0}, g_effectLogged{0};  // Skinned draws not keeping their bones the usual way, left to the game.
 
 // CommandListSpatialIdentity_IdentifyObject for one instance: what to draw, and its slot.
-Override Identify(Runtime* rt, int componentId, const uint8_t* config, uint64_t frame, uint32_t* slot) {
+Override Identify(Runtime* rt, int componentId, const uint8_t* config, uint64_t frame, uint32_t* slot, bool unique) {
     *slot = 0;
     if (!rt->spatialIdentification || !config) return Override::kCustom;
     float p[3];
@@ -278,19 +293,82 @@ Override Identify(Runtime* rt, int componentId, const uint8_t* config, uint64_t 
     const auto expired = [&](const Runtime::SpatialSlot& s) { return s.used && frame > s.lastRead + kSpatialExpireFrames; };
     if (!found) {
         // pool_allocate_slot_on_missing: a free slot, or an expired one.
-        for (Runtime::SpatialSlot& s : rt->spatial) {
-            if (!s.used || expired(s)) {
-                found = &s;
-                break;
+        float nearest = -1.0f;
+        uint64_t nearestSeen = 0;
+        for (const Runtime::SpatialSlot& s : rt->spatial) {
+            if (!s.used) continue;
+            const float dx = s.position[0] - p[0], dy = s.position[1] - p[1], dz = s.position[2] - p[2];
+            const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (nearest < 0 || d < nearest) {
+                nearest = d;
+                nearestSeen = frame > s.lastRead ? frame - s.lastRead : 0;
             }
         }
-        if (!found) return Override::kOriginal;  // The pool is full: not tracked.
-        *found = Runtime::SpatialSlot{};
-        found->used = true;
+        // An object of the mod's seen lately, somewhere else: this is most likely it, moved at
+        // once (a party member swapped to another place, a dodge, a skill that teleports).
+        // EFMI starts it as new: a frame not drawn, then posed with zeros for the bones not
+        // imported yet (the mesh collapses). It stays the mod's here, with its bones.
+        Runtime::SpatialSlot* known = nullptr;
+        for (Runtime::SpatialSlot& s : rt->spatial) {
+            if (unique && s.used && s.state == Runtime::SpatialSlot::kCustom && frame <= s.lastRead + kSpatialForgetFrames &&
+                (!known || s.lastRead > known->lastRead)) {
+                known = &s;
+            }
+        }
+        if (known && expired(*known)) {
+            found = known;  // Its own slot: state and bones as they are.
+            g_newObjects[2].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            for (Runtime::SpatialSlot& s : rt->spatial) {
+                if (&s != known && (!s.used || expired(s))) {
+                    found = &s;
+                    break;
+                }
+            }
+            if (!found) return Override::kOriginal;  // The pool is full: not tracked.
+            *found = Runtime::SpatialSlot{};
+            found->used = true;
+            if (known) {
+                // Seen this frame or the last few at its old place too (both drawn while it moves):
+                // a slot of its own, the mod's from the start, with the known one's bones.
+                found->state = Runtime::SpatialSlot::kCustom;
+                found->componentBits = known->componentBits;
+                const uint32_t from = static_cast<uint32_t>(known - rt->spatial), to = static_cast<uint32_t>(found - rt->spatial);
+                if (rt->hasSkeleton) efmibones::CopyInstance(&rt->skeleton, from, to);
+                if (rt->recordCount) efmibones::CopyInstance(&rt->records, from, to);
+                g_newObjects[2].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_newObjects[0].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (g_newObjectsLogged.fetch_add(1, std::memory_order_relaxed) < 60) {
+            if (known) {
+                LogInfo("spatial: %s: object at %.2f %.2f %.2f is the mod's one from %.2f m away (moved at once): kept the mod's", rt->name.c_str(), p[0],
+                        p[1], p[2], nearest);
+            } else if (nearest < 0) {
+                LogInfo("spatial: %s: new object at %.2f %.2f %.2f (no other)", rt->name.c_str(), p[0], p[1], p[2]);
+            } else {
+                LogInfo("spatial: %s: new object at %.2f %.2f %.2f; the nearest known one is %.2f m away, seen %llu presents ago", rt->name.c_str(),
+                        p[0], p[1], p[2], nearest, static_cast<unsigned long long>(nearestSeen));
+            }
+        }
     } else if (expired(*found)) {
-        // pool_expiration_reset_elements: its value back to the default (0).
-        found->state = Runtime::SpatialSlot::kEmpty;
-        found->componentBits = 0;
+        const uint64_t unseen = frame - found->lastRead;
+        if (unique && found->state == Runtime::SpatialSlot::kCustom && unseen <= kSpatialForgetFrames) {
+            // The mod's object, back after a short time unseen (culled, a cutscene cut, a pass
+            // the game skipped): EFMI forgets it after a frame and skips it as new, so it
+            // flickers out with half its bones zero. Here it stays the mod's, bones and all.
+            g_newObjects[2].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // pool_expiration_reset_elements: its value back to the default (0).
+            found->state = Runtime::SpatialSlot::kEmpty;
+            found->componentBits = 0;
+            g_newObjects[1].fetch_add(1, std::memory_order_relaxed);
+            if (g_newObjectsLogged.fetch_add(1, std::memory_order_relaxed) < 60) {
+                LogInfo("spatial: %s: object at %.2f %.2f %.2f new again after %llu presents unseen", rt->name.c_str(), p[0], p[1], p[2],
+                        static_cast<unsigned long long>(unseen));
+            }
+        }
     }
     // The slot follows its object: the position it was last seen at. Kept where first seen, a
     // moving character left its slot every 0.375 m and came back as a new object, skipped
@@ -452,6 +530,7 @@ void MakeSkeleton(Runtime* rt, const std::vector<std::vector<uint8_t>>& data) {
         }
     }
     rt->skeleton.Init(rt->bonesCount, std::move(components));
+    rt->skeleton.name = rt->name;
     rt->hasSkeleton = true;
     LogInfo("%s: merged skeleton of %u bones, %zu components", rt->name.c_str(), rt->bonesCount, rt->skeletonComponents.size());
 }
@@ -469,12 +548,66 @@ void MakeRecords(Runtime* rt) {
         for (uint32_t b = 0; b < kRecordBones; ++b) rt->recordPalettes[i].push_back(static_cast<uint16_t>(i * kRecordBones + b));
     }
     rt->records.Init(static_cast<uint32_t>(rt->recordCount * kRecordBones), std::move(components));
+    rt->records.name = rt->name + " (records)";
     LogInfo("%s: %zu bone records (cross-IB bones)", rt->name.c_str(), rt->recordCount);
+}
+
+// A mod's ini and files, by size and last write: the same, and a reload keeps what is loaded.
+uint64_t Fingerprint(const std::wstring& ini, const std::vector<EfmiBuffer>& files, const std::vector<std::wstring>& textureFiles) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const auto add = [&](const std::wstring& path) {
+        WIN32_FILE_ATTRIBUTE_DATA a{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) {
+            h = (h ^ 0xdead) * 0x100000001b3ull;
+            return;
+        }
+        for (const uint64_t v : {uint64_t(a.nFileSizeLow) | uint64_t(a.nFileSizeHigh) << 32,
+                                 uint64_t(a.ftLastWriteTime.dwLowDateTime) | uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32}) {
+            h = (h ^ v) * 0x100000001b3ull;
+        }
+    };
+    add(ini);
+    for (const EfmiBuffer& b : files) add(b.path);
+    for (const std::wstring& t : textureFiles) add(t);
+    return h;
+}
+
+// A mod's textures; ones already loaded from the same unchanged file are shared, so a reload
+// does not load them into VRAM again.
+std::vector<int> LoadTextures(const Runtime* rt) {
+    static std::mutex mu;
+    static auto* cache = new std::map<std::wstring, std::pair<uint64_t, int>>();  // File -> (its size and time, id).
+    std::vector<int> ids(rt->textureFiles.size(), -1);
+    std::vector<std::wstring> missing;
+    std::vector<size_t> where;
+    std::vector<uint64_t> stamps;
+    {
+        std::lock_guard lock(mu);
+        for (size_t i = 0; i < rt->textureFiles.size(); ++i) {
+            const uint64_t stamp = Fingerprint(rt->textureFiles[i], {}, {});
+            const auto it = cache->find(rt->textureFiles[i]);
+            if (it != cache->end() && it->second.first == stamp && it->second.second >= 0) {
+                ids[i] = it->second.second;
+                continue;
+            }
+            missing.push_back(rt->textureFiles[i]);
+            where.push_back(i);
+            stamps.push_back(stamp);
+        }
+    }
+    if (missing.empty()) return ids;
+    const std::vector<int> loaded = efmitex::Load(rt->name, missing);
+    std::lock_guard lock(mu);
+    for (size_t k = 0; k < missing.size() && k < loaded.size(); ++k) {
+        ids[where[k]] = loaded[k];
+        (*cache)[missing[k]] = {stamps[k], loaded[k]};
+    }
+    return ids;
 }
 
 // One allocation for all of a mod's buffers, written once by the CPU.
 void LoadGpu(Runtime* rt) {
-    rt->textureIds = efmitex::Load(rt->name, rt->textureFiles);
+    rt->textureIds = LoadTextures(rt);
     if (rt->files.empty()) {  // Only hides components: nothing to load.
         rt->load.store(Load::kReady, std::memory_order_release);
         return;
@@ -744,7 +877,7 @@ void Press(Runtime* rt, size_t k) {
 std::atomic<bool> g_deviceReady{false}, g_preloaded{false};
 void Preload() {
     if (!g_deviceReady.load() || !g_loaded.load(std::memory_order_acquire) || g_preloaded.exchange(true)) return;
-    for (Runtime* rt : *g_runtimes) {
+    for (Runtime* rt : *g_runtimes.load()) {
         Load expected = Load::kNone;
         if (rt->load.compare_exchange_strong(expected, Load::kLoading)) {
             PostJob([rt] { Guard("LoadGpu", [&] { LoadGpu(rt); }); });
@@ -759,8 +892,14 @@ void OnDeviceReady() {
 }
 
 void LoadMods() {
+    std::lock_guard reloadLock(g_reloadMu);
     const ModIndex* index = efmi::GetModIndex();
     if (!index) return;
+    const bool reload = g_loaded.load(std::memory_order_acquire);
+    const std::vector<Runtime*>& before = *g_runtimes.load();
+    auto* runtimes = new std::vector<Runtime*>();
+    auto* byHash = new ByHash();
+    size_t kept = 0, fresh = 0;
     const std::wstring dir = index->Dir();
     const std::wstring userIni = dir.substr(0, dir.find_last_of(L'\\')) + L"\\d3dx_user.ini";
     std::set<std::string> files;
@@ -776,9 +915,25 @@ void LoadMods() {
         std::wstring relative = ini::Widen(file);
         std::replace(relative.begin(), relative.end(), L'/', L'\\');
         const std::wstring path = dir + L"\\" + relative;
+        // Unchanged since it loaded: kept as it is (its buffers, textures, toggles).
+        Runtime* same = nullptr;
+        for (Runtime* old : before) {
+            if (old->ini == path && old->fingerprint == Fingerprint(path, old->files, old->textureFiles)) same = old;
+        }
+        if (same) {
+            const auto list = same->components.load();
+            for (size_t c = 0; c < list->size(); ++c) (*byHash)[(*list)[c].hash].push_back({same, c});
+            components += list->size();
+            for (const auto& [hash, texture] : same->thisByHash) textureHashes.insert(hash);
+            for (uint32_t h : same->textureHashes) textureHashes.insert(h);
+            runtimes->push_back(same);
+            ++kept;
+            continue;
+        }
         const std::map<std::string, int> saved = SavedToggles(file);
         std::optional<EfmiMod> mod = ParseEfmiMod(path, file, userIni, &saved);
         if (!mod) continue;
+        ++fresh;
         auto* rt = new Runtime();
         rt->name = file;
         rt->ini = path;
@@ -802,25 +957,53 @@ void LoadMods() {
             const size_t at = texture.find(L"t=", texture.find_last_of(L'\\'));
             if (at != std::wstring::npos) textureHashes.insert(static_cast<uint32_t>(wcstoul(texture.c_str() + at + 2, nullptr, 16)));
         }
-        for (size_t c = 0; c < mod->components.size(); ++c) (*g_byHash)[mod->components[c].hash].push_back({rt, c});
+        for (size_t c = 0; c < mod->components.size(); ++c) (*byHash)[mod->components[c].hash].push_back({rt, c});
         components += mod->components.size();
         rt->components.store(std::make_shared<const std::vector<EfmiComponent>>(std::move(mod->components)));
-        g_runtimes->push_back(rt);
+        rt->fingerprint = Fingerprint(path, rt->files, rt->textureFiles);
+        runtimes->push_back(rt);
     }
     textureHashes.erase(0);
     textures::SetTargets(std::move(textureHashes));
+    // The new set, at once: a draw sees the old one or the new one.
+    g_byHash.store(byHash, std::memory_order_release);
+    g_runtimes.store(runtimes, std::memory_order_release);
     g_loaded.store(true, std::memory_order_release);
-    LogInfo("efmi mods: %zu with %zu components, ready to draw", g_runtimes->size(), components);
-    Preload();
+    LogInfo("efmi mods: %zu with %zu components, ready to draw", runtimes->size(), components);
+    if (!reload) {
+        Preload();
+        return;
+    }
+    size_t dropped = 0;
+    for (Runtime* old : before) dropped += std::find(runtimes->begin(), runtimes->end(), old) == runtimes->end();
+    LogInfo("mods reloaded: %zu unchanged, %zu read again, %zu gone or changed (their old copies stay in memory until the game closes)", kept, fresh, dropped);
+    // The new and changed ones load now, not at their first draw.
+    if (g_deviceReady.load()) {
+        for (Runtime* rt : *runtimes) {
+            Load expected = Load::kNone;
+            if (rt->load.compare_exchange_strong(expected, Load::kLoading)) PostJob([rt] { Guard("LoadGpu", [&] { LoadGpu(rt); }); });
+        }
+    }
+}
+
+void Reload() {
+    efmi::LoadModIndex();
+    LoadMods();
 }
 
 bool TryReplace(VkCommandBuffer cb, const Draw& draw, const BindState& state) {
-    if (!g_loaded.load(std::memory_order_acquire) || !g_enabled.load(std::memory_order_relaxed) || g_failSafe.load(std::memory_order_relaxed)) {
+    if (!g_loaded.load(std::memory_order_acquire) || !g_enabled.load(std::memory_order_relaxed) || g_failSafe.load(std::memory_order_relaxed) ||
+        autofix::ModsOff()) {
         return false;
     }
-    const auto found = g_byHash->find(draw.hash);
-    if (found == g_byHash->end()) return false;
+    const ByHash* byHash = g_byHash.load(std::memory_order_acquire);
+    const auto found = byHash->find(draw.hash);
+    if (found == byHash->end()) return false;
     bool skip = false;  // An instance in its object's first frame: drawn by no one.
+    // A mesh only one mod names says which character this is; one several name (Ember's and
+    // Laevatain's) does not, so it never lets a mod take an object over at once (Identify).
+    bool unique = true;
+    for (const Target& t : found->second) unique = unique && t.rt == found->second.front().rt;
     for (const Target& t : found->second) {
         Runtime* rt = t.rt;
         const auto components = rt->components.load(std::memory_order_acquire);
@@ -847,11 +1030,39 @@ bool TryReplace(VkCommandBuffer cb, const Draw& draw, const BindState& state) {
         efmibones::BoneBinding bones;
         const bool skeletal = rt->hasSkeleton && c.componentId >= 0 && (c.gpuPosed || c.readOnly);
         const bool wantBones = skeletal || (rt->recordCount && (!list.recordIds.empty() || crossDraws));
-        const bool boneBinding = draw.firstInstance == 0 && state.sets && efmibones::FindBoneBinding(state.sets, &bones);
+        const bool boneBinding = draw.firstInstance == 0 && state.sets && efmibones::FindBoneBinding(state.sets, &bones, state.vsResources);
+        // CommandListMergedSkeleton_DetectBoneDataSource: a skinned component's draw that does
+        // not keep its bones the usual way (an effect pass) is left to the game, as EFMI leaves
+        // a mesh it cannot pose. Read the usual way, its config and bones are garbage: the
+        // mod's mesh thrown across the screen, and a phantom object for the spatial pool.
+        // Only the component's own bones are looked at: past them the game's buffer holds the
+        // next object's data (a transform 400 m out looks like a bone there), and checking 8
+        // bones of a part with fewer turned its ordinary draws away, flickering to the game's.
+        uint32_t ownBones = 0;
+        if (skeletal && c.componentId >= 0 && static_cast<size_t>(c.componentId) < rt->skeleton.components.size()) {
+            const efmibones::Component& sc = rt->skeleton.components[c.componentId];
+            ownBones = sc.count;
+            if (c.lod > 0 && c.lod < static_cast<int>(efmibones::kMaxLods) && !sc.lodRemap[c.lod].empty()) {
+                uint32_t most = 0;
+                for (const uint16_t r : sc.lodRemap[c.lod]) most = std::max<uint32_t>(most, r + 1u);
+                ownBones = std::min(ownBones, most);
+            }
+        }
+        std::string why;
+        if (skeletal && c.gpuPosed && !c.readOnly && boneBinding && !efmibones::UsualBones(bones, std::min<uint32_t>(8, ownBones), &why)) {
+            g_effectDraws.fetch_add(1, std::memory_order_relaxed);
+            if (g_effectLogged.fetch_add(1, std::memory_order_relaxed) < 60) {
+                LogInfo("effect pass? %s [%s]: pass cull %u, %u colour targets, depth write %d, pipeline %016llx: %s", rt->name.c_str(), c.section.c_str(),
+                        state.cullMode, state.colorTargets, state.depthWrite, (unsigned long long)state.pipeline, why.c_str());
+            }
+            LogOnce(rt, t.component, kEffectPass, "a draw that does not keep its bones the usual way (an effect pass): the game's mesh is drawn, as EFMI's");
+            return false;
+        }
         // EFMI's spatial identification of this instance: skipped on its object's first frame,
         // the game's draw until identified, the mod's once identified.
         uint32_t slot = 0;
-        const Override what = Identify(rt, c.componentId, boneBinding ? bones.config : nullptr, g_stats.presents.load(std::memory_order_relaxed), &slot);
+        const Override what =
+            Identify(rt, c.componentId, boneBinding ? bones.config : nullptr, g_stats.presents.load(std::memory_order_relaxed), &slot, unique);
         g_identified[static_cast<int>(what)].fetch_add(1, std::memory_order_relaxed);
         if (what == Override::kSkip) {
             skip = true;
@@ -889,6 +1100,24 @@ bool TryReplace(VkCommandBuffer cb, const Draw& draw, const BindState& state) {
         efmitex::BindOptions options;
         options.drawKey = reinterpret_cast<uint64_t>(rt) ^ (uint64_t(t.component) << 48);
         options.pipeline = state.pipeline;
+        // ps-tN lines, where auto-fix learned register N is on Vulkan (passes that draw colour:
+        // DX11's ps-t registers are the pixel shader's).
+        efmitex::SlotPut slots[16];
+        const auto learned = state.colorTargets && !list.textures.empty() ? autofix::LearnedSlots() : nullptr;
+        if (learned && !learned->empty()) {
+            for (const EfmiTextureBind& tb : list.textures) {
+                const auto it = learned->find(tb.slot);
+                if (it == learned->end() || tb.texture >= static_cast<int>(rt->textureIds.size())) continue;
+                // One place per shader layout: Bind uses the one whose layout the draw's set has.
+                for (const autofix::SlotLocation& at : it->second) {
+                    if (options.slotCount < 16) slots[options.slotCount++] = {at.set, at.binding, at.element, at.layoutSig, rt->textureIds[tb.texture]};
+                }
+            }
+            if (options.slotCount) {
+                options.slots = slots;
+                LogOnce(rt, t.component, kSlots, "%u ps-t textures put where auto-fix learned their registers are", options.slotCount);
+            }
+        }
         if (list.drawOriginal) {
             // The game's mesh, drawn by the layer with the mod's textures in its sets.
             const uint32_t swapped = state.sets ? efmitex::Bind(cb, state.sets, replace, nullptr, 0, &options) : 0;
@@ -1039,7 +1268,16 @@ bool TryReplace(VkCommandBuffer cb, const Draw& draw, const BindState& state) {
         efmitex::BufferPatch patches[2];
         uint32_t patchCount = 0;
         if (palette) {
-            if (!efmibones::Redirect(cb, &rt->skeleton, static_cast<uint32_t>(c.componentId), c.lod, palette, bones, slot, bones.config, patches)) {
+            // The list's first draw's buffers, for the CPU skin check at fill time.
+            efmibones::SkinCheck skin;
+            const EfmiDrawCall& first = list.draws.front();
+            if (first.vb[0] >= 0 && first.vb[2] >= 0 && rt->gpu[first.vb[0]].mapped && rt->gpu[first.vb[2]].mapped && rt->gpu[first.vb[0]].stride >= 12) {
+                const GpuBuffer& p = rt->gpu[first.vb[0]];
+                const GpuBuffer& bl = rt->gpu[first.vb[2]];
+                skin = {p.mapped, p.stride, bl.mapped, bl.stride, std::min(p.size / p.stride, bl.size / bl.stride)};
+            }
+            if (!efmibones::Redirect(cb, &rt->skeleton, static_cast<uint32_t>(c.componentId), c.lod, palette, bones, slot, bones.config, patches,
+                                     &skin)) {
                 LogOnce(rt, t.component, kRingFull, "the bone ring is full this frame; the game's mesh is drawn");
                 return false;
             }
@@ -1174,14 +1412,20 @@ void OnPresent() {}
 void LogStats() {
     LogInfo("spatial identification: %llu instances skipped (their object's first frame), %llu left to the game (not identified), %llu drawn by the mod",
             (unsigned long long)g_identified[0].load(), (unsigned long long)g_identified[1].load(), (unsigned long long)g_identified[2].load());
+    LogInfo("spatial identification: new objects %llu with no known one at their place, %llu new again after a time unseen; %llu of the mods' "
+            "back after a short time or moved at once, kept",
+            (unsigned long long)g_newObjects[0].load(), (unsigned long long)g_newObjects[1].load(), (unsigned long long)g_newObjects[2].load());
+    LogInfo("effect passes: %llu skinned mod draws not keeping their bones the usual way, left to the game", (unsigned long long)g_effectDraws.load());
 }
 
-void PollKeys() {
+void PollKeys(bool debugKeys) {
     if (!g_loaded.load(std::memory_order_acquire)) return;
-    // Debug views, behind Alt as WWMI12's were: Alt+M magenta test, Alt+H hide replaced draws.
+    // Debug views, behind Alt as WWMI12's were (only with debug keys on): Alt+M magenta test,
+    // Alt+H hide replaced draws, Alt+N hide one draw of each list, Alt+B bone modes.
     static bool mWasDown = false, hWasDown = false, nWasDown = false;
     const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-    const bool m = alt && (GetAsyncKeyState('M') & 0x8000) != 0, h = alt && (GetAsyncKeyState('H') & 0x8000) != 0;
+    const bool views = debugKeys && alt;
+    const bool m = views && (GetAsyncKeyState('M') & 0x8000) != 0, h = views && (GetAsyncKeyState('H') & 0x8000) != 0;
     if (m && !mWasDown) {
         const bool on = efmitex::ToggleMagenta();
         LogInfo("magenta test %s: slots given mod textures show magenta", on ? "on" : "off");
@@ -1195,7 +1439,7 @@ void PollKeys() {
     }
     mWasDown = m;
     hWasDown = h;
-    const bool n = alt && (GetAsyncKeyState('N') & 0x8000) != 0;
+    const bool n = views && (GetAsyncKeyState('N') & 0x8000) != 0;
     if (n && !nWasDown) {
         // None, then the 1st, 2nd, ... draw of every list, up to the 16th, then none again.
         const int next = g_hideDraw.load() + 1 >= 16 ? -1 : g_hideDraw.load() + 1;
@@ -1208,8 +1452,16 @@ void PollKeys() {
         MessageBeep(next < 0 ? MB_ICONHAND : MB_OK);
     }
     nWasDown = n;
+    // Alt+B: how mod draws get their bones and config, to compare live (efmibones::CycleMode).
+    static bool bWasDown = false;
+    const bool b = views && (GetAsyncKeyState('B') & 0x8000) != 0;
+    if (b && !bWasDown) {
+        const int mode = efmibones::CycleMode();
+        MessageBeep(mode == 0 ? MB_OK : MB_ICONASTERISK);
+    }
+    bWasDown = b;
     if (alt) return;  // Alt+key is a debug view, not a mod's key.
-    for (Runtime* rt : *g_runtimes) {
+    for (Runtime* rt : *g_runtimes.load()) {
         for (size_t k = 0; k < rt->keys.size(); ++k) {
             const bool down = (GetAsyncKeyState(rt->keys[k].vk) & 0x8000) != 0;
             if (down && !rt->keyDown[k]) Press(rt, k);
@@ -1222,6 +1474,48 @@ bool ToggleEnabled() {
     const bool on = !g_enabled.load();
     g_enabled.store(on);
     return on;
+}
+
+std::vector<autofix::ModInfo> DescribeMods() {
+    std::vector<autofix::ModInfo> out;
+    if (!g_loaded.load(std::memory_order_acquire)) return out;
+    for (const Runtime* rt : *g_runtimes.load()) {
+        autofix::ModInfo m;
+        m.name = rt->name;
+        m.ini = rt->ini;
+        for (size_t t = 0; t < rt->textureFiles.size(); ++t) {
+            autofix::ModTexture tex;
+            tex.file = ToUtf8(rt->textureFiles[t]);
+            tex.fileHash = t < rt->textureHashes.size() ? rt->textureHashes[t] : 0;
+            for (const auto& [hash, index] : rt->thisByHash) {
+                if (index == static_cast<int>(t)) tex.iniHashes.push_back(hash);
+            }
+            efmitex::DdsInfo(rt->textureFiles[t], &tex.width, &tex.height, &tex.vkFormat);
+            const size_t slash = tex.file.find_last_of("/\\");
+            tex.componentIds = autofix::ComponentIdsOfName(slash == std::string::npos ? tex.file : tex.file.substr(slash + 1));
+            tex.everMatched = textures::EverMatched(tex.fileHash);
+            for (uint32_t h : tex.iniHashes) tex.everMatched = tex.everMatched || textures::EverMatched(h);
+            m.textures.push_back(std::move(tex));
+        }
+        for (const EfmiComponent& c : *rt->components.load(std::memory_order_acquire)) {
+            autofix::ModComponent k;
+            k.hash = c.hash;
+            k.indexCount = c.indexCount;
+            k.section = c.section;
+            k.componentId = c.componentId;
+            if (k.componentId < 0) {  // Older exports: no $\EFMIv1\component_id, the number in "TextureOverride_Component7".
+                const size_t at = c.section.rfind("component");
+                if (at != std::string::npos && at + 9 < c.section.size() && isdigit(static_cast<unsigned char>(c.section[at + 9]))) {
+                    k.componentId = atoi(c.section.c_str() + at + 9);
+                }
+            }
+            k.lod = c.lod;
+            for (const EfmiTextureBind& tb : c.list.textures) k.slots.push_back({tb.slot, tb.texture});
+            m.components.push_back(std::move(k));
+        }
+        out.push_back(std::move(m));
+    }
+    return out;
 }
 
 }  // namespace efmivulkan::efmidraw

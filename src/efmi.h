@@ -31,6 +31,11 @@ void OnIndirectDraw();
 void OnPresent();
 
 void RequestCapture();  // F10.
+
+// For auto-fix: a draw's index region hash (0: its data never seen), and whether some mod
+// component has its index count.
+uint32_t RegionHashOf(const IndexedDraw& d);
+bool AnyModHasIndexCount(uint32_t count);
 void LogStats();
 
 }  // namespace efmivulkan::efmi

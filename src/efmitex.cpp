@@ -14,13 +14,14 @@
 #include "common.h"
 #include "log.h"
 #include "texhash.h"
+#include "textures.h"
 
 namespace efmivulkan::efmitex {
 namespace {
 
 // A pool is reusable after this many presents. Some command buffers are submitted up to 3
 // frames after they were recorded, and then run on the GPU for a frame or two more.
-constexpr uint64_t kFramesInFlight = 8;
+constexpr uint64_t kFramesInFlight = 24;
 constexpr uint32_t kPoolSets = 2048, kPoolDescriptors = 16384;
 
 DeviceFns g_fns;
@@ -893,16 +894,92 @@ void SubmittedCopies(VkCommandBuffer cb) {
     RedoCopies(copies);
 }
 
+namespace {
+
+// The binding and array element of an image descriptor at a place in a template's data.
+bool BindingAt(const std::vector<VkDescriptorUpdateTemplateEntry>& entries, size_t at, uint32_t* binding, uint32_t* element) {
+    for (const auto& e : entries) {
+        if (IsBuffer(e.descriptorType) || at < e.offset) continue;
+        const size_t stride = e.stride ? e.stride : sizeof(VkDescriptorImageInfo);
+        const size_t k = (at - e.offset) / stride;
+        if (k < e.descriptorCount && (at - e.offset) % stride == 0) {
+            *binding = e.dstBinding;
+            *element = e.dstArrayElement + static_cast<uint32_t>(k);
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+uint64_t LayoutSignature(const std::vector<VkDescriptorUpdateTemplateEntry>& entries) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 0x100000001b3ull;
+    };
+    for (const auto& e : entries) {
+        mix(e.dstBinding);
+        mix(e.dstArrayElement);
+        mix(static_cast<uint64_t>(e.descriptorType));
+        mix(e.descriptorCount);
+    }
+    return h;
+}
+
+void DescribeBound(const BoundSet* sets, std::vector<BoundImageInfo>* out, bool requestReadback) {
+    if (!g_lookups.Contents) return;
+    SetContents c;
+    for (uint32_t i = 0; i < kMaxSets; ++i) {
+        if (!sets[i].set || !g_lookups.Contents(sets[i].set, &c) || c.images.empty()) continue;
+        const uint64_t sig = LayoutSignature(c.entries);
+        for (const ImageEntry& e : c.images) {
+            for (uint32_t k = 0; k < e.count; ++k) {
+                const size_t at = size_t(e.offset) + size_t(k) * e.stride;
+                if (at + sizeof(VkDescriptorImageInfo) > c.data.size()) break;
+                const auto* info = reinterpret_cast<const VkDescriptorImageInfo*>(c.data.data() + at);
+                if (!info->imageView) continue;
+                BoundImageInfo b;
+                b.set = i;
+                b.layoutSig = sig;
+                if (!BindingAt(c.entries, at, &b.binding, &b.element)) continue;
+                if (!g_lookups.ImageOfView || !g_lookups.ImageOfView(info->imageView, &b.image)) continue;
+                b.modHash = g_lookups.TextureHashOfView(info->imageView);
+                b.measured = textures::MeasuredHashOf(b.image.id);
+                if (requestReadback && !b.measured && b.image.readable) RequestReadback(b.image, info->imageLayout);
+                out->push_back(b);
+            }
+        }
+    }
+}
+
+bool DdsInfo(const std::wstring& path, uint32_t* width, uint32_t* height, uint32_t* vkFormat) {
+    Dds d;
+    if (!ReadDds(path, &d)) return false;
+    *width = d.width;
+    *height = d.height;
+    *vkFormat = d.vkFormat;
+    return true;
+}
+
 uint32_t Bind(VkCommandBuffer cb, const BoundSet* sets, const std::map<uint32_t, int>& replace, const BufferPatch* patches,
               uint32_t patchCount, const BindOptions* options) {
-    if ((replace.empty() && !patchCount) || !g_lookups.Contents) return 0;
+    const uint32_t slotCount = options ? options->slotCount : 0;
+    if ((replace.empty() && !patchCount && !slotCount) || !g_lookups.Contents) return 0;
     uint32_t bound = 0;
     SetContents c;
     for (uint32_t i = 0; i < kMaxSets; ++i) {
         bool patched = false;
         for (uint32_t p = 0; p < patchCount; ++p) patched |= patches[p].set == i;
-        if (!sets[i].set || (!patched && replace.empty())) continue;
+        if (!sets[i].set || (!patched && replace.empty() && !slotCount)) continue;
         if (!g_lookups.Contents(sets[i].set, &c) || (c.images.empty() && !patched)) continue;
+        uint64_t sig = 0;
+        bool slotsHere = false;
+        if (slotCount) {
+            sig = LayoutSignature(c.entries);
+            for (uint32_t s = 0; s < slotCount; ++s) slotsHere |= options->slots[s].set == i && options->slots[s].layoutSig == sig;
+        }
         bool changed = false;
         uint32_t bufferEdits[8], bufferEditCount = 0;
         std::vector<Edit> edits;
@@ -968,6 +1045,14 @@ uint32_t Bind(VkCommandBuffer cb, const BoundSet* sets, const std::map<uint32_t,
                     }
                     if (use >= 0 && !Ready(use)) use = -1;
                     if (use >= 0) g_stickyUsed.fetch_add(1, std::memory_order_relaxed);
+                }
+                // A ps-tN texture, where auto-fix learned register N is: nothing else went there.
+                uint32_t binding = 0, element = 0;
+                if (use < 0 && slotsHere && BindingAt(c.entries, at, &binding, &element)) {
+                    for (uint32_t s = 0; s < slotCount; ++s) {
+                        const SlotPut& p = options->slots[s];
+                        if (p.set == i && p.binding == binding && p.element == element && p.layoutSig == sig && Ready(p.texture)) use = p.texture;
+                    }
                 }
                 // Once per mod component and pass: each texture slot, and what went in.
                 if (options && describe()) {

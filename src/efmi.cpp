@@ -195,6 +195,13 @@ void OnPresent() {
     }
 }
 
+uint32_t RegionHashOf(const IndexedDraw& d) { return d.indexBytes ? HashOf(d) : 0; }
+
+bool AnyModHasIndexCount(uint32_t count) {
+    const ModIndex* mods = GetModIndex();
+    return mods && mods->HasIndexCount(count);
+}
+
 void RequestCapture() {
     Capture idle = Capture::kIdle;
     g_capture.compare_exchange_strong(idle, Capture::kArmed);

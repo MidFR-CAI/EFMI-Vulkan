@@ -28,6 +28,12 @@ void OnMipUpload(uint64_t imageId, uint32_t vkFormat, uint32_t mip, uint32_t wid
 // The mod hash an image matched, or 0.
 uint32_t HashOf(uint64_t imageId);
 
+// For auto-fix: the DX11 hash an image's pixels give as measured (its own format, size and
+// mips), matched or not; 0 when its pixels were never seen. And whether the game showed a
+// hash this session.
+uint32_t MeasuredHashOf(uint64_t imageId);
+bool EverMatched(uint32_t hash);
+
 void LogStats();
 
 }  // namespace efmivulkan::textures

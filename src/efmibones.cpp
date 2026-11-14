@@ -15,7 +15,7 @@ namespace {
 
 // The ring: one segment per frame in flight, each free again when its frame comes round,
 // plus room past the end for the config range the shaders declare.
-constexpr uint32_t kSegments = 8;  // Some command buffers are submitted 3 frames after recording.
+constexpr uint32_t kSegments = 24;  // Some command buffers are submitted 3 frames after recording, then run later still.
 constexpr VkDeviceSize kSegmentBytes = 2ull << 20;  // Peak seen in game: 612 KB a frame.
 // The first kStaticRows rows: identity bones, as EFMI's implicit bones at the start of its
 // merged buffer, where config offsets below the static rows point.
@@ -90,18 +90,37 @@ VkDeviceSize Allocate(VkDeviceSize bytes) {
 struct Job {
     bool fill = false;  // Else an import.
     Skeleton* s = nullptr;
-    const uint8_t* config = nullptr;
+    // The game's instance config as it was when the draw was recorded: by submit its memory
+    // can hold another frame's.
+    std::array<uint8_t, kConfigBytes> config{};
     // Import.
     uint32_t component = 0;
     int lod = 0;
-    const uint8_t* bones = nullptr;
-    uint64_t boneRows = 0;
     uint64_t frame = 0;
     uint32_t slot = 0;  // The spatial-identification slot: the skeleton region.
+    // The component's bones (12 floats each, this frame's and last frame's), read from the
+    // game's rolling buffer when recorded, into the version of the skeleton of that frame.
+    std::vector<float> current, previous;
+    bool hasCurrent = false, hasPrevious = false;
     // Fill.
     const std::vector<uint16_t>* palette = nullptr;
     VkDeviceSize configAt = 0, currentAt = 0, previousAt = 0;
+    const uint8_t* liveConfig = nullptr;  // The game's config memory itself (CycleMode bit 1).
+    // Import read at submit (CycleMode bit 4), or a check at submit of one read at record:
+    // the game's bone buffer and its config, live.
+    bool deferRead = false, check = false;
+    SkinCheck skin;  // Fill: the mod's vertices, to skin a sample of on the CPU.
+    const uint8_t* liveBones = nullptr;
+    uint64_t boneRows = 0;
+    uint64_t recordHash = 0;  // Check: the bones as read at record.
 };
+
+std::atomic<int> g_mode{0};  // CycleMode.
+// The game's bones as read: with impossible values when read at record, at submit; read at
+// record and different at submit (the game wrote them in between).
+std::atomic<uint64_t> g_badAtRecord{0}, g_badAtSubmit{0}, g_changedBySubmit{0}, g_checked{0}, g_badLogged{0}, g_badFills{0}, g_badConfigs{0};
+std::atomic<uint64_t> g_skinChecks{0}, g_skinBad{0}, g_skinLogged{0};
+std::atomic<uint64_t> g_bonesGuessWrong{0}, g_bonesGuessLogged{0};  // Draws whose shader reads bones elsewhere than the old guess.  // RunFill's sample of vertices skinned on the CPU.
 
 std::atomic<bool> g_any{false};  // Any job ever: until then the hooks return at once.
 std::mutex g_jobMu;
@@ -131,35 +150,114 @@ bool ConfigValid(const uint8_t* config, uint64_t boneRows) {
 
 const float kIdentity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
 
-// MergedSkeleton_BoneDataImporter_RollingBuffer.hlsl: the component's bones from the game's
-// buffer at the instance config's row 5 offsets (each only when past the static rows), LoD
-// remapped, scaled by the mod's mesh scale, into the slot's region.
+// MergedSkeleton_BoneDataImporter_RollingBuffer.hlsl, its read: the component's bones from
+// the game's buffer at the instance config's row 5 offsets (each only when past the static
+// rows), LoD remapped, scaled by the mod's mesh scale. NaN marks a bone left as it is.
+void CaptureImport(Job& j, const uint8_t* bones, uint64_t boneRows) {
+    const Skeleton& s = *j.s;
+    const Component& c = s.components[j.component];
+    const uint32_t current = Row5(j.config.data(), 0), previous = Row5(j.config.data(), 1);
+    const std::vector<uint16_t>* remap = j.lod > 0 && j.lod < static_cast<int>(kMaxLods) && !c.lodRemap[j.lod].empty() ? &c.lodRemap[j.lod] : nullptr;
+    const float scale = s.meshScale;
+    const uint32_t count = c.offset < s.bones ? std::min(c.count, s.bones - c.offset) : 0;
+    j.hasCurrent = current >= kStaticRows;
+    j.hasPrevious = previous >= kStaticRows;
+    const auto read = [&](std::vector<float>& to, uint32_t start) {
+        to.assign(size_t(count) * 12, NAN);
+        for (uint32_t b = 0; b < count; ++b) {
+            const uint32_t source = remap ? (b < remap->size() ? (*remap)[b] : b) : b;
+            const uint64_t row = uint64_t(start) + 3 + 3ull * source;
+            if (row + 3 > boneRows) continue;
+            float* dst = &to[size_t(b) * 12];
+            memcpy(dst, bones + row * 16, 48);
+            if (scale != 1.0f) {
+                for (int k = 0; k < 12; ++k) dst[k] *= scale;
+            }
+        }
+    };
+    if (j.hasCurrent) read(j.current, current);
+    if (j.hasPrevious) read(j.previous, previous);
+}
+
+// Bone values no real pose has: not a number, or past 10 km (bones are in the object's own
+// space). NaN first is CaptureImport's mark for a bone not read.
+bool BadBones(const std::vector<float>& v) {
+    for (size_t b = 0; b * 12 < v.size(); ++b) {
+        const float* m = &v[b * 12];
+        if (std::isnan(m[0])) continue;
+        for (int k = 0; k < 12; ++k) {
+            if (!std::isfinite(m[k]) || std::fabs(m[k]) > 1e4f) return true;
+        }
+    }
+    return false;
+}
+
+uint64_t HashBones(const std::vector<float>& v) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const auto* p = reinterpret_cast<const uint8_t*>(v.data());
+    for (size_t i = 0; i < v.size() * sizeof(float); ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+void LogBad(const Job& j, const char* when) {
+    if (g_badLogged.fetch_add(1, std::memory_order_relaxed) >= 30) return;
+    LogInfo("merged skeleton: %s component %u slot %u: the game's bones read %s have impossible values", j.s->name.c_str(), j.component, j.slot, when);
+}
+
+// The newest version of a frame before `frame`, or null.
+const SkeletonVersion* NewestBefore(const SkeletonInstance& in, uint64_t frame) {
+    const SkeletonVersion* best = nullptr;
+    for (const SkeletonVersion& v : in.versions) {
+        if (v.frame != UINT64_MAX && v.frame < frame && (!best || v.frame > best->frame)) best = &v;
+    }
+    return best;
+}
+
+// The version of `frame`, made from the newest one before it the first time (bones not
+// imported this frame stay as last imported). s.mu held.
+SkeletonVersion& VersionOf(SkeletonInstance& in, uint64_t frame) {
+    SkeletonVersion& v = in.versions[frame % kVersions];
+    if (v.frame == frame) return v;
+    if (v.frame != UINT64_MAX && v.frame > frame) return v;  // Recorded very late: the slot holds a newer frame.
+    const SkeletonVersion* from = NewestBefore(in, frame);
+    if (from && from != &v) {
+        v.current = from->current;
+        v.previous = from->previous;
+    } else if (!from) {
+        v.current.assign(in.floats, 0.0f);
+        v.previous.assign(in.floats, 0.0f);
+    }
+    v.imported.assign(in.updateFrame.size(), 0);
+    v.frame = frame;
+    return v;
+}
+
+// Its write: into the slot's region, in the version of the frame it was recorded in, and in
+// the versions of later frames already made from it that have not imported this component.
 void RunImport(const Job& j) {
-    const uint32_t current = Row5(j.config, 0), previous = Row5(j.config, 1);
     g_imports.fetch_add(1, std::memory_order_relaxed);
     Skeleton& s = *j.s;
     if (j.component >= s.components.size() || j.slot >= kMaxInstances) return;
     const Component& c = s.components[j.component];
     std::lock_guard lock(s.mu);
     SkeletonInstance& in = s.instances[j.slot];
-    const std::vector<uint16_t>* remap = j.lod > 0 && j.lod < static_cast<int>(kMaxLods) && !c.lodRemap[j.lod].empty() ? &c.lodRemap[j.lod] : nullptr;
-    const float scale = s.meshScale;
-    const auto copy = [&](float* to, uint64_t row) {
-        memcpy(to, j.bones + row * 16, 48);
-        if (scale != 1.0f) {
-            for (int k = 0; k < 12; ++k) to[k] *= scale;
+    const auto apply = [&](std::vector<float>& to, const std::vector<float>& from) {
+        for (size_t b = 0; b * 12 < from.size(); ++b) {
+            if (std::isnan(from[b * 12])) continue;
+            const size_t at = (size_t(c.offset) + b) * 12;
+            if (at + 12 <= to.size()) memcpy(&to[at], &from[b * 12], 48);
         }
     };
-    for (uint32_t b = 0; b < c.count && c.offset + b < s.bones; ++b) {
-        const uint32_t source = remap ? (b < remap->size() ? (*remap)[b] : b) : b;
-        if (current >= kStaticRows) {
-            const uint64_t row = uint64_t(current) + 3 + 3ull * source;
-            if (row + 3 <= j.boneRows) copy(&in.current[size_t(c.offset + b) * 12], row);
-        }
-        if (previous >= kStaticRows) {
-            const uint64_t row = uint64_t(previous) + 3 + 3ull * source;
-            if (row + 3 <= j.boneRows) copy(&in.previous[size_t(c.offset + b) * 12], row);
-        }
+    const auto write = [&](SkeletonVersion& v) {
+        if (j.hasCurrent) apply(v.current, j.current);
+        if (j.hasPrevious) apply(v.previous, j.previous);
+    };
+    SkeletonVersion& mine = VersionOf(in, j.frame);
+    write(mine);
+    if (j.component < mine.imported.size()) mine.imported[j.component] = 1;
+    for (SkeletonVersion& v : in.versions) {
+        const bool own = j.component < v.imported.size() && v.imported[j.component];  // That frame's own import stands.
+        if (&v != &mine && v.frame != UINT64_MAX && v.frame > j.frame && !own) write(v);
     }
 }
 
@@ -168,19 +266,43 @@ void RunImport(const Job& j) {
 // slot's bones this mod draw's palette uses (the 8-bit indices Vulkan's pipelines read).
 void RunFill(const Job& j) {
     g_fills.fetch_add(1, std::memory_order_relaxed);
+    const int mode = g_mode.load(std::memory_order_relaxed);
+    const uint8_t* source = (mode & 1) && j.liveConfig ? j.liveConfig : j.config.data();
     uint8_t* config = g_ringMapped + j.configAt;
-    memcpy(config, j.config, kConfigBytes);
-    uint32_t rows[2] = {Row5(j.config, 0), Row5(j.config, 1)};
+    memcpy(config, source, kConfigBytes);
+    {
+        // The object's transform (rows 0 to 3): impossible values throw the whole draw away.
+        float t[16];
+        memcpy(t, source, sizeof(t));
+        bool bad = false;
+        for (float v : t) bad = bad || !std::isfinite(v) || std::fabs(v) > 1e6f;
+        if (bad) {
+            g_badConfigs.fetch_add(1, std::memory_order_relaxed);
+            if (g_badLogged.fetch_add(1, std::memory_order_relaxed) < 30) {
+                LogInfo("merged skeleton: %s component %u slot %u: a mod draw got a config with an impossible transform", j.s->name.c_str(), j.component, j.slot);
+            }
+        }
+    }
+    uint32_t rows[2] = {Row5(source, 0), Row5(source, 1)};
     if (rows[0] >= kStaticRows) rows[0] = static_cast<uint32_t>(j.currentAt / 16);
     if (rows[1] >= kStaticRows) rows[1] = static_cast<uint32_t>(j.previousAt / 16);
     memcpy(config + kBoneOffsetsRow * 16, rows, sizeof(rows));
     Skeleton& s = *j.s;
     if (j.slot >= kMaxInstances) return;
     std::lock_guard lock(s.mu);
-    const SkeletonInstance& in = s.instances[j.slot];
+    SkeletonInstance& in = s.instances[j.slot];
+    // The skeleton as of the frame this draw was recorded in. Gone (recorded more than
+    // kVersions frames ago): the newest there is.
+    const SkeletonVersion* version = nullptr;
+    for (const SkeletonVersion& v : in.versions) {
+        if (v.frame == j.frame && !(mode & 2)) version = &v;  // Mode 2 and 3: the newest, below.
+    }
+    if (!version && !(mode & 2)) version = NewestBefore(in, j.frame);
+    if (!version) version = NewestBefore(in, UINT64_MAX);
+    static const std::vector<float> kNone;
     for (int which = 0; which < 2; ++which) {
         uint8_t* block = g_ringMapped + (which ? j.previousAt : j.currentAt);
-        const std::vector<float>& from = which ? in.previous : in.current;
+        const std::vector<float>& from = !version ? kNone : which ? version->previous : version->current;
         memcpy(block, kIdentity, 48);  // The 3 rows before bone 0 (the implicit bones' in EFMI).
         bool any = false;
         for (size_t i = 0; i < j.palette->size(); ++i) {
@@ -193,6 +315,60 @@ void RunFill(const Job& j) {
             }
         }
         if (which == 0 && !any) g_zeroFills.fetch_add(1, std::memory_order_relaxed);
+    }
+    // A sample of the mod's vertices skinned as the vertex shader does, with the bones this
+    // draw gets: a vertex far from the object is a triangle thrown across the screen.
+    // One fill in 1024, 16 vertices: the mod's buffers are in VRAM, slow for the CPU to read.
+    const SkinCheck& k = j.skin;
+    const bool sampled = (g_fills.load(std::memory_order_relaxed) & 1023) == 0;
+    if (sampled && version && k.positions && k.blend && k.vertices && (k.blendStride == 12 || k.blendStride == 32)) {
+        g_skinChecks.fetch_add(1, std::memory_order_relaxed);
+        const bool floatWeights = k.blendStride == 32;
+        // The palette's bones from the CPU copy of the skeleton, as the fill put them in the ring.
+        std::vector<float> paletteBones(j.palette->size() * 12, 0.0f);
+        for (size_t i = 0; i < j.palette->size(); ++i) {
+            const size_t m = (*j.palette)[i];
+            if (m * 12 + 12 <= version->current.size()) memcpy(&paletteBones[i * 12], &version->current[m * 12], 48);
+        }
+        const float* bonesAt = paletteBones.data();
+        const uint64_t step = std::max<uint64_t>(1, k.vertices / 16);
+        for (uint64_t v = 0; v < k.vertices; v += step) {
+            float p[3];
+            memcpy(p, k.positions + v * k.positionStride, sizeof(p));
+            const uint8_t* bl = k.blend + v * k.blendStride;
+            float out[3] = {}, total = 0;
+            uint32_t idx[4]{};
+            float w[4]{};
+            for (int n = 0; n < 4; ++n) {
+                if (floatWeights) {
+                    memcpy(&w[n], bl + 4 * n, 4);
+                    memcpy(&idx[n], bl + 16 + 4 * n, 4);
+                } else {
+                    uint16_t u;
+                    memcpy(&u, bl + 2 * n, 2);
+                    w[n] = u / 65535.0f;
+                    idx[n] = bl[8 + n];
+                }
+                if (w[n] == 0) continue;
+                total += w[n];
+                if (idx[n] >= j.palette->size()) {
+                    out[0] = 1e9f;  // Past the palette: the GPU reads whatever follows the block.
+                    break;
+                }
+                const float* m = bonesAt + size_t(idx[n]) * 12;
+                for (int r = 0; r < 3; ++r) out[r] += w[n] * (m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3]);
+            }
+            const float len = std::sqrt(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
+            if (len <= 5.0f || total == 0) continue;
+            g_skinBad.fetch_add(1, std::memory_order_relaxed);
+            if (g_skinLogged.fetch_add(1, std::memory_order_relaxed) < 40) {
+                LogInfo("skin check: %s component %u slot %u: vertex %llu at %.2f %.2f %.2f lands %.1f m out; bones %u %u %u %u (palette of %zu), "
+                        "weights %.2f %.2f %.2f %.2f",
+                        s.name.c_str(), j.component, j.slot, (unsigned long long)v, p[0], p[1], p[2], len, idx[0], idx[1], idx[2], idx[3],
+                        j.palette->size(), w[0], w[1], w[2], w[3]);
+            }
+            break;  // One a draw is enough.
+        }
     }
     if (!j.palette->empty() && !s.fillLogged) {
         s.fillLogged = true;
@@ -226,8 +402,12 @@ void Skeleton::Init(uint32_t boneCount, std::vector<Component> c) {
         for (uint32_t b = 0; b < components[k].count && components[k].offset + b < bones; ++b) boneComponent[components[k].offset + b] = static_cast<uint16_t>(k);
     }
     for (SkeletonInstance& in : instances) {
-        in.current.assign(size_t(bones) * 12, 0.0f);
-        in.previous = in.current;
+        in.floats = size_t(bones) * 12;
+        for (SkeletonVersion& v : in.versions) {
+            v.frame = UINT64_MAX;
+            v.current.clear();
+            v.previous.clear();
+        }
         in.updateFrame.assign(components.size(), UINT64_MAX);
         in.lodLevel.assign(components.size(), 0);
     }
@@ -236,14 +416,27 @@ void Skeleton::Init(uint32_t boneCount, std::vector<Component> c) {
 void SetDevice(const DeviceFns& fns) { g_fns = fns; }
 void SetLookups(const Lookups& l) { g_lookups = l; }
 
-bool FindBoneBinding(const efmitex::BoundSet* sets, BoneBinding* out) {
+bool FindBoneBinding(const efmitex::BoundSet* sets, BoneBinding* out, const std::vector<spirv::Resource>* vs) {
     if (!g_lookups.Contents || !g_lookups.Mapped) return false;
     efmitex::SetContents c;
     bool bones = false;
     VkDeviceSize bonesSize = 0;
+    // Only the buffers the vertex shader declares, when its SPIR-V says which.
+    const bool known = vs && !vs->empty();
+    const auto declared = [&](uint32_t set, uint32_t binding, spirv::Kind kind) {
+        if (!known) return true;
+        for (const spirv::Resource& r : *vs) {
+            if (r.set == set && r.binding == binding && r.kind == kind) return true;
+        }
+        return false;
+    };
+    // The old guess (the largest storage buffer at offset 0), to log where it was wrong.
+    uint32_t guessSet = UINT32_MAX, guessBinding = 0;
+    VkDeviceSize guessSize = 0;
     struct Candidate {
         uint32_t set, binding, element;
         const uint8_t* config;
+        uint64_t available;
     };
     Candidate configs[8];
     uint32_t configCount = 0;
@@ -266,34 +459,97 @@ bool FindBoneBinding(const efmitex::BoundSet* sets, BoneBinding* out) {
                     if (d >= 0 && d < static_cast<int>(sets[i].dynamicCount)) offset += sets[i].dynamic[d];
                 }
                 const VkDeviceSize range = info.range == VK_WHOLE_SIZE ? size - offset : info.range;
+                if (!uniform && offset == 0 && size > guessSize) {
+                    guessSize = size;
+                    guessSet = i;
+                    guessBinding = e.dstBinding;
+                }
                 if (uniform && range == kConfigRange && offset + kConfigBytes <= size) {
-                    if (configCount < 8) configs[configCount++] = {i, e.dstBinding, e.dstArrayElement + k, mapped + offset};
-                } else if (!uniform && offset == 0 && size > bonesSize) {
+                    if (configCount < 8 && declared(i, e.dstBinding, spirv::Kind::kUniformBuffer)) {
+                        configs[configCount++] = {i, e.dstBinding, e.dstArrayElement + k, mapped + offset, std::min<uint64_t>(size - offset, kConfigRange)};
+                    }
+                } else if (!uniform && (known ? declared(i, e.dstBinding, spirv::Kind::kStorageBuffer) && range > bonesSize
+                                              : offset == 0 && size > bonesSize)) {
+                    // The shader's own storage buffer (at its offset), or the old guess.
                     bones = true;
-                    bonesSize = size;
+                    bonesSize = known ? range : size;
                     out->bonesSet = i;
                     out->bonesBinding = e.dstBinding;
                     out->bonesElement = e.dstArrayElement + k;
-                    out->bones = mapped;
-                    out->boneRows = size / 16;
+                    out->bones = mapped + offset;
+                    out->boneRows = (known ? range : size) / 16;
                 }
             }
         }
     }
     if (!bones) return false;
+    if (known && (guessSet != out->bonesSet || guessBinding != out->bonesBinding)) {
+        g_bonesGuessWrong.fetch_add(1, std::memory_order_relaxed);
+        if (g_bonesGuessLogged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LogInfo("merged skeleton: the vertex shader reads its bones at set %u binding %u; the old guess was set %u binding %u", out->bonesSet,
+                    out->bonesBinding, guessSet, guessBinding);
+        }
+    }
     for (uint32_t k = 0; k < configCount; ++k) {
         if (!ConfigValid(configs[k].config, out->boneRows)) continue;
         out->configSet = configs[k].set;
         out->configBinding = configs[k].binding;
         out->configElement = configs[k].element;
         out->config = configs[k].config;
+        out->configAvailable = configs[k].available;
         return true;
     }
     g_noConfig.fetch_add(1, std::memory_order_relaxed);
     return false;
 }
 
-void Import(VkCommandBuffer /*cb*/, Skeleton* s, uint32_t component, int lod, const BoneBinding& b, uint32_t slot, const uint8_t* config) {
+bool UsualBones(const BoneBinding& b, uint32_t sampleBones, std::string* why) {
+    if (!b.config) return false;
+    float t[16];
+    memcpy(t, b.config, sizeof(t));
+    char text[512];
+    const auto fail = [&](const char* reason, float a = 0, float c = 0, float d = 0) {
+        if (why) {
+            snprintf(text, sizeof(text), "%s (%g %g %g); rows 0-3: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g; row 5: %u %u", reason, a, c, d, t[0],
+                     t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15], Row5(b.config, 0), Row5(b.config, 1));
+            *why = text;
+        }
+        return false;
+    };
+    if (!std::isfinite(t[15]) || std::fabs(t[15] - 1.0f) > 1e-3f) return fail("row 3 w is not 1", t[15]);  // Row 3: the position, w 1.
+    for (int r = 0; r < 4; ++r) {
+        for (int k = 0; k < 4; ++k) {
+            if (!std::isfinite(t[r * 4 + k]) || std::fabs(t[r * 4 + k]) > 1e6f) return fail("transform out of range", float(r), float(k), t[r * 4 + k]);
+        }
+    }
+    for (int r = 0; r < 3; ++r) {
+        const float len = std::sqrt(t[r * 4] * t[r * 4] + t[r * 4 + 1] * t[r * 4 + 1] + t[r * 4 + 2] * t[r * 4 + 2]);
+        if (!(len > 1e-3f && len < 1e3f)) return fail("rotation row length", float(r), len);  // Rotation and scale.
+    }
+    const uint32_t first = Row5(b.config, 0);
+    if (first < kStaticRows || !b.bones) return true;  // No skeleton of its own: nothing more to tell.
+    for (uint32_t i = 0; i < sampleBones; ++i) {
+        const uint64_t row = uint64_t(first) + 3 + 3ull * i;
+        if (row + 3 > b.boneRows) break;
+        float m[12];
+        memcpy(m, b.bones + row * 16, sizeof(m));
+        for (float v : m) {
+            if (!std::isfinite(v)) return fail("bone not a number", float(i));
+        }
+        if (std::fabs(m[3]) > 50.0f || std::fabs(m[7]) > 50.0f || std::fabs(m[11]) > 50.0f) return fail("bone translation past 50 m", m[3], m[7], m[11]);
+    }
+    return true;
+}
+
+void CopyInstance(Skeleton* s, uint32_t from, uint32_t to) {
+    if (from >= kMaxInstances || to >= kMaxInstances || from == to) return;
+    std::lock_guard lock(s->mu);
+    s->instances[to] = s->instances[from];
+    // Imported again for this slot from its own draws, this frame already.
+    std::fill(s->instances[to].updateFrame.begin(), s->instances[to].updateFrame.end(), UINT64_MAX);
+}
+
+void Import(VkCommandBuffer cb, Skeleton* s, uint32_t component, int lod, const BoneBinding& b, uint32_t slot, const uint8_t* config) {
     if (component >= s->components.size() || slot >= kMaxInstances) return;
     const uint64_t frame = g_frame.load(std::memory_order_relaxed);
     {
@@ -307,22 +563,34 @@ void Import(VkCommandBuffer /*cb*/, Skeleton* s, uint32_t component, int lod, co
     }
     Job j;
     j.s = s;
-    j.config = config;
+    memcpy(j.config.data(), config, kConfigBytes);
     j.component = component;
     j.lod = lod;
-    j.bones = b.bones;
-    j.boneRows = b.boneRows;
     j.frame = frame;
     j.slot = slot;
-    // Copied now, as the draw is recorded: the game has written this draw's bones and config
-    // by then (EFMI's importer reads them at the draw, on the GPU). At submit the config's
-    // memory can already hold another frame's.
+    j.liveBones = b.bones;
+    j.boneRows = b.boneRows;
+    j.liveConfig = config;
+    if (g_mode.load(std::memory_order_relaxed) & 4) {
+        // Read at submit (CycleMode bit 4): in recorded order with the fills, from the game's
+        // memory as it is then.
+        j.deferRead = true;
+        Push(cb, j);
+        return;
+    }
+    // Read now, as the draw is recorded, into this frame's version of the skeleton.
+    CaptureImport(j, b.bones, b.boneRows);
+    if (BadBones(j.current)) {
+        g_badAtRecord.fetch_add(1, std::memory_order_relaxed);
+        LogBad(j, "as the draw was recorded");
+    }
     RunImport(j);
-    g_any.store(true, std::memory_order_relaxed);
+    // (A check at submit of whether the game wrote them after the draw was recorded found it
+    // does not: 2 in 50,000. Gone, as it read the game's memory a second time per import.)
 }
 
 bool Redirect(VkCommandBuffer cb, Skeleton* s, uint32_t component, int lod, const std::vector<uint16_t>* palette, const BoneBinding& b,
-              uint32_t slot, const uint8_t* config, efmitex::BufferPatch patches[2]) {
+              uint32_t slot, const uint8_t* config, efmitex::BufferPatch patches[2], const SkinCheck* check) {
     if (!CreateRing()) return false;
     const VkDeviceSize blockBytes = (3 + 3 * VkDeviceSize(palette->size())) * 16;
     const VkDeviceSize configAt = Allocate(kConfigBytes), currentAt = Allocate(blockBytes), previousAt = Allocate(blockBytes);
@@ -332,9 +600,10 @@ bool Redirect(VkCommandBuffer cb, Skeleton* s, uint32_t component, int lod, cons
     j.s = s;
     j.component = component;
     j.lod = lod;
-    j.config = config;
+    memcpy(j.config.data(), config, kConfigBytes);
+    j.liveConfig = config;
+    if (check) j.skin = *check;
     j.palette = palette;
-    j.boneRows = b.boneRows;
     j.configAt = configAt;
     j.currentAt = currentAt;
     j.previousAt = previousAt;
@@ -373,10 +642,37 @@ void OnSubmitted(const VkCommandBuffer* cbs, uint32_t count) {
     for (const Job& j : jobs) {
         if (j.fill) {
             Guard("bones fill", [&] { RunFill(j); });
+        } else if (j.check) {
+            Guard("bones check", [&] {
+                Job now = j;
+                CaptureImport(now, j.liveBones, j.boneRows);
+                g_checked.fetch_add(1, std::memory_order_relaxed);
+                if (HashBones(now.current) != j.recordHash) g_changedBySubmit.fetch_add(1, std::memory_order_relaxed);
+                if (BadBones(now.current)) g_badAtSubmit.fetch_add(1, std::memory_order_relaxed);
+            });
+        } else if (j.deferRead) {
+            Guard("bones import", [&] {
+                Job now = j;
+                memcpy(now.config.data(), j.liveConfig, kConfigBytes);
+                CaptureImport(now, j.liveBones, j.boneRows);
+                if (BadBones(now.current)) {
+                    g_badAtSubmit.fetch_add(1, std::memory_order_relaxed);
+                    LogBad(now, "at submit");
+                }
+                RunImport(now);
+            });
         } else {
             Guard("bones import", [&] { RunImport(j); });
         }
     }
+}
+
+int CycleMode() {
+    const int mode = (g_mode.load() + 1) % 8;
+    g_mode.store(mode);
+    LogInfo("bones mode %d: config %s, bones %s, the game's bones read %s%s", mode, mode & 1 ? "at submit" : "as recorded",
+            mode & 2 ? "the newest" : "of the frame recorded in", mode & 4 ? "at submit" : "as recorded", mode == 0 ? " (the default)" : "");
+    return mode;
 }
 
 void LogStats() {
@@ -386,6 +682,14 @@ void LogStats() {
             (unsigned long long)g_imports.load(), (unsigned long long)g_fills.load(), (unsigned long long)g_zeroFills.load(),
             (unsigned long long)g_noConfig.load(),
             (unsigned long long)(g_ringPeak.load() >> 10), (unsigned long long)(kSegmentBytes >> 10));
+    LogInfo("merged skeleton: the game's bones read as recorded: %llu checked at submit, %llu changed by then; impossible values: %llu as "
+            "recorded, %llu at submit; mod draws given impossible bones %llu, an impossible transform %llu",
+            (unsigned long long)g_checked.load(), (unsigned long long)g_changedBySubmit.load(), (unsigned long long)g_badAtRecord.load(),
+            (unsigned long long)g_badAtSubmit.load(), (unsigned long long)g_badFills.load(), (unsigned long long)g_badConfigs.load());
+    LogInfo("skin check: %llu mod draws' vertices skinned on the CPU, %llu with a vertex more than 5 m from its object",
+            (unsigned long long)g_skinChecks.load(), (unsigned long long)g_skinBad.load());
+    LogInfo("merged skeleton: %llu draws whose vertex shader reads its bones elsewhere than the old guess (now followed)",
+            (unsigned long long)g_bonesGuessWrong.load());
 }
 
 void OnPresent() {

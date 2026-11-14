@@ -32,10 +32,40 @@ How to use
 
 Keys (in game)
 --------------
-F9            mods on or off
+Shift+F8      fix mods broken by a game update (also: F in the EFMIVulkan window)
+Shift+F9      mods on or off
+Shift+F10     reload every mod, without restarting the game (also: R in the EFMIVulkan window)
 Mod keys      every mod's own toggle keys work as in XXMI, and are remembered
-Alt+M         debug: every texture a mod replaces turns magenta
-Alt+H         debug: hide everything the mods draw (shows what the game draws itself)
+
+Debug keys (F10 frame capture, Ctrl+F10 / Ctrl+Shift+F10 auto-fix in two steps, Alt+M
+magenta textures, Alt+H hide the mods, Alt+N hide one draw, Alt+B bone modes) are off. To
+turn them on, for looking into a mod that does not draw right, create an empty file named
+"debugkeys" in %USERPROFILE%\efmivulkan and start the game again.
+
+
+Fix mods (mods broken by a game update)
+---------------------------------------
+Have some of the broken characters on screen, close enough to see clearly, and press
+Shift+F8 in game (or F in the EFMIVulkan window). The mods go off for a moment while
+EFMIVulkan looks at the game's own characters, and a few seconds later you hear a beep: the
+mods it could fix are fixed and reloaded. Each press is kept for the session and adds to the
+ones before, so swap in the next broken characters and press it again:
+  - A part whose ID (hash) the update changed gets the new one: the game's part of the same
+    size on the same character. A part the update re-made (another size) cannot be fixed:
+    the mod needs a new version from its author.
+  - A texture whose ID changed gets the one game texture of its size and format there.
+  - Texture slots: mods that put a texture into a numbered DX11 slot (ps-t14 = ...) need to
+    know where that slot is on Vulkan. Each capture adds what it sees to slots.ini, and a
+    slot is used once that is clear.
+Every changed mod ini is backed up first, next to it ("mod.ini <date> <time>.BAK"); to undo,
+delete the ini and rename the .BAK back. What was changed, and what could not be and why,
+is in %USERPROFILE%\efmivulkan\autofix.log. The fixed mods are reloaded straight away.
+
+
+Reload
+------
+Shift+F10 (or R in the EFMIVulkan window) reads your Mods folder again: new, edited and
+removed mods take effect without restarting the game.
 
 
 Logs and problems

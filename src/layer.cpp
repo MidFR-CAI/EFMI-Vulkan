@@ -34,7 +34,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "autofix.h"
 #include "common.h"
+#include "spirv.h"
 #include "efmi.h"
 #include "efmidraw.h"
 #include "efmibones.h"
@@ -102,6 +104,8 @@ struct DeviceData {
     PFN_vkCmdBindVertexBuffers2 CmdBindVertexBuffers2;
     PFN_vkCmdBindVertexBuffers2 CmdBindVertexBuffers2EXT;
     PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
+    PFN_vkCreateShaderModule CreateShaderModule;
+    PFN_vkDestroyShaderModule DestroyShaderModule;
     PFN_vkDestroyPipeline DestroyPipeline;
     PFN_vkCmdBindPipeline CmdBindPipeline;
     PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
@@ -126,6 +130,7 @@ struct DeviceData {
     PFN_vkCmdExecuteCommands CmdExecuteCommands;
     PFN_vkCmdSetCullMode CmdSetCullMode;
     PFN_vkCmdSetCullMode CmdSetCullModeEXT;
+    PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCreateImageView CreateImageView;
     PFN_vkDestroyImageView DestroyImageView;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
@@ -383,7 +388,14 @@ struct PipelineInfo {
     // What pass it draws in: culling (vkCmdSetCullMode when dynamic), colour targets, depth writes.
     uint32_t cullMode = 0, frontFace = 0, colorTargets = 0;
     bool dynamicCull = false, depthWrite = false;
+    // The buffers its vertex shader declares (set, binding, uniform or storage): where it
+    // really reads its bones and instance config. Null: unknown.
+    std::shared_ptr<const std::vector<spirv::Resource>> vsResources;
 };
+// What each shader module declares, from its SPIR-V, for the pipelines made from it.
+std::mutex g_moduleMu;
+std::unordered_map<VkShaderModule, std::shared_ptr<const std::vector<spirv::Resource>>>* g_modules =
+    new std::unordered_map<VkShaderModule, std::shared_ptr<const std::vector<spirv::Resource>>>();
 // Vertex attributes of each pipeline, only for the dump of a replaced draw.
 std::unordered_map<VkPipeline, std::vector<VkVertexInputAttributeDescription>>* g_pipelineAttrs =
     new std::unordered_map<VkPipeline, std::vector<VkVertexInputAttributeDescription>>();
@@ -423,6 +435,10 @@ struct CommandState {
     efmidraw::VertexBinding vb[efmidraw::kMaxBindings];
     PipelineInfo pipeline;  // The bound graphics pipeline's.
     uint32_t dynamicCullMode = 0;  // vkCmdSetCullMode.
+    // vkCmdPushConstants, as last pushed (the first 128 bytes): for auto-fix's capture, to find
+    // how a draw picks its entry in the 64 KB instance config block.
+    uint8_t pushed[128]{};
+    uint32_t pushedBytes = 0;  // The highest byte pushed since begin.
     std::vector<PendingCopy> copies;
     std::vector<PendingImageUpload> imageUploads;
 };
@@ -536,26 +552,67 @@ void StartBackground() {
         PostJob([] {
             Guard("LoadModIndex", [] { efmi::LoadModIndex(); });
             Guard("LoadMods", [] { efmidraw::LoadMods(); });
+            Guard("LoadLearnedSlots", [] { autofix::LoadLearnedSlots(); });
         });
         std::thread([] {
-            bool f10WasDown = false, f9WasDown = false;
             ULONGLONG lastStats = GetTickCount64();
+            // The EFMIVulkan window's keys (F: fix mods, R: reload mods) set these. Named with
+            // this process's id: the window signals the game it started, nothing else.
+            const auto named = [](const wchar_t* what) {
+                wchar_t name[96];
+                swprintf(name, 96, L"Local\\EFMIVulkan.%s.%lu", what, GetCurrentProcessId());
+                return CreateEventW(nullptr, FALSE, FALSE, name);
+            };
+            const HANDLE fixEvent = named(L"AutoFix");
+            const HANDLE reloadEvent = named(L"Reload");
+            // The keys for finding problems (F10 frame capture, Ctrl+F10 / Ctrl+Shift+F10 auto-fix
+            // in two steps, Alt+M/H/N/B views) are bound only while a file named "debugkeys" is in
+            // the log folder: out of the way in play, there again when a mod needs looking into.
+            const bool debugKeys = GetFileAttributesW((LogDir() + L"\\debugkeys").c_str()) != INVALID_FILE_ATTRIBUTES;
+            LogInfo("keys: Shift+F8 fix mods, Shift+F9 mods on/off, Shift+F10 reload mods%s",
+                    debugKeys ? "; debug keys on (F10, Ctrl+F10, Ctrl+Shift+F10, Alt+M/H/N/B)" : "");
+            bool wasDown[4]{};  // F8, F9, F10, and F10 for the debug keys.
+            const auto pressed = [&](int k, int vk) {
+                const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+                const bool now = down && !wasDown[k];
+                wasDown[k] = down;
+                return now;
+            };
+            const auto signalled = [](HANDLE e) { return e && WaitForSingleObject(e, 0) == WAIT_OBJECT_0; };
             for (;;) {
                 Sleep(30);
-                const bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-                if (f10 && !f10WasDown) {
-                    efmi::RequestCapture();
+                const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0, shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                const bool f8 = pressed(0, VK_F8), f9 = pressed(1, VK_F9), f10 = pressed(2, VK_F10);
+                if ((f8 && shift && !ctrl) || signalled(fixEvent)) {
+                    autofix::RequestFix();  // Shift+F8: capture what is on screen, fix from every capture kept.
                     MessageBeep(MB_ICONASTERISK);
                 }
-                f10WasDown = f10;
-                const bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-                if (f9 && !f9WasDown) {
-                    const bool on = efmidraw::ToggleEnabled();
+                if (f9 && shift && !ctrl) {
+                    const bool on = efmidraw::ToggleEnabled();  // Shift+F9.
                     LogInfo("mods %s", on ? "on" : "off");
                     MessageBeep(on ? MB_OK : MB_ICONHAND);
                 }
-                f9WasDown = f9;
-                Guard("PollKeys", [] { efmidraw::PollKeys(); });
+                if ((f10 && shift && !ctrl) || signalled(reloadEvent)) {
+                    LogInfo("mods: reloading");  // Shift+F10, or R in the EFMIVulkan window.
+                    MessageBeep(MB_ICONASTERISK);
+                    PostJob([] {
+                        Guard("Reload", [] { efmidraw::Reload(); });
+                        MessageBeep(MB_OK);
+                    });
+                }
+                if (debugKeys && f10 && !shift) {
+                    if (ctrl) {
+                        autofix::RequestCapture();  // Ctrl+F10: one capture, kept, previewed.
+                    } else {
+                        efmi::RequestCapture();  // F10: one frame's draws, frame.log and crossref.log.
+                    }
+                    MessageBeep(MB_ICONASTERISK);
+                }
+                if (debugKeys && f10 && shift && ctrl) {
+                    autofix::RequestApply();  // Ctrl+Shift+F10: fix from the kept captures.
+                    MessageBeep(MB_ICONASTERISK);
+                }
+                Guard("PollKeys", [&] { efmidraw::PollKeys(debugKeys); });
                 if (GetTickCount64() - lastStats >= 15000) {
                     lastStats = GetTickCount64();
                     Guard("LogStats", [] {
@@ -726,6 +783,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer cb, const VkCo
     s->copies.clear();
     s->imageUploads.clear();
     for (auto& set : s->sets) set = {};
+    s->pushedBytes = 0;
     s->beginFrame = g_stats.presents.load(std::memory_order_relaxed);
     s->submits = s->executions = 0;
     const VkResult r = Device(cb)->BeginCommandBuffer(cb, info);
@@ -981,20 +1039,71 @@ void DumpReplacedDraw(const CommandState* s, uint32_t hash, uint32_t indexCount,
     }
 }
 
+// Auto-fix's capture of one game draw of a size some mod uses: its hash, pass, the
+// position in its bone config (its character), and the textures its sets hold.
+void CaptureForAutofix(const CommandState* s, const efmi::IndexedDraw& d) {
+    autofix::CapturedDraw c;
+    c.hash = efmi::RegionHashOf(d);
+    c.indexCount = d.indexCount;
+    c.firstIndex = d.firstIndex;
+    c.colorTargets = s->pipeline.colorTargets;
+    efmibones::BoneBinding bones;
+    if (d.firstInstance == 0 && efmibones::FindBoneBinding(s->sets, &bones, s->pipeline.vsResources.get()) && bones.config) {
+        memcpy(c.position, bones.config + 3 * 16, sizeof(c.position));  // Instance config values 12, 13, 14.
+        c.hasPosition = true;
+        memcpy(c.config, bones.config, sizeof(c.config));
+        c.hasConfig = true;
+        uint32_t first = 0;
+        memcpy(&first, bones.config + 5 * 16, 4);  // Row 5 x: this frame's bones.
+        const uint64_t row = uint64_t(first) + 3;  // Bone 0, after the 3 rows before it.
+        if (bones.bones && first >= efmibones::kStaticRows && row + 3 <= bones.boneRows) {
+            for (int k = 0; k < 3; ++k) memcpy(&c.bone0[k], bones.bones + (row + k) * 16 + 12, 4);
+            c.hasBone0 = true;
+        }
+        // Every valid instance config in the 64 KB block (256 of 16 rows): row 5 has a bone row
+        // past the static ones, inside the bone buffer, and 1.0f last.
+        for (uint32_t e = 0; uint64_t(e + 1) * efmibones::kConfigBytes <= bones.configAvailable; ++e) {
+            const uint8_t* entry = bones.config + size_t(e) * efmibones::kConfigBytes;
+            uint32_t r5[4];
+            memcpy(r5, entry + 5 * 16, sizeof(r5));
+            if (r5[3] != 0x3f800000u || r5[0] < efmibones::kStaticRows || r5[0] >= bones.boneRows) continue;
+            autofix::CapturedDraw::ConfigEntry ce{e, {}, r5[0]};
+            memcpy(ce.position, entry + 3 * 16, sizeof(ce.position));
+            c.entries.push_back(ce);
+        }
+    }
+    c.pushed.assign(s->pushed, s->pushed + s->pushedBytes);
+    std::vector<efmitex::BoundImageInfo> images;
+    efmitex::DescribeBound(s->sets, &images, true);
+    for (const efmitex::BoundImageInfo& b : images) {
+        autofix::BoundImage i;
+        i.at = {b.set, b.binding, b.element, b.layoutSig};
+        i.imageId = b.image.id;
+        i.width = b.image.width;
+        i.height = b.image.height;
+        i.vkFormat = b.image.format;
+        i.modHash = b.modHash;
+        i.measured = b.measured;
+        c.images.push_back(i);
+    }
+    autofix::OnDraw(std::move(c));
+}
+
 VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex, int32_t vertexOffset,
                                           uint32_t firstInstance) {
     bool replaced = false;
     Guard("CmdDrawIndexed", [&] {
         const CommandState* s = Command(cb);
         if (!s->indexKey) return;
-        const uint32_t hash =
-            efmi::OnIndexedDraw({s->indexKey, s->indexBytes, indexCount, instanceCount, firstIndex, firstInstance, vertexOffset, s->indexMapped});
+        const efmi::IndexedDraw indexed{s->indexKey, s->indexBytes, indexCount, instanceCount, firstIndex, firstInstance, vertexOffset, s->indexMapped};
+        if (autofix::Recording() && efmi::AnyModHasIndexCount(indexCount)) CaptureForAutofix(s, indexed);
+        const uint32_t hash = efmi::OnIndexedDraw(indexed);
         if (!hash) return;
         const efmidraw::BindState state{s->indexBuffer, s->indexOffset, s->indexType, s->vb, s->pipeline.strides, s->pipeline.dynamicStride,
                                         s->pipeline.keepGame, s->sets,
                                         s->pipeline.dynamicCull ? s->dynamicCullMode : s->pipeline.cullMode, s->pipeline.frontFace,
                                         s->pipeline.colorTargets, s->pipeline.depthWrite, reinterpret_cast<uint64_t>(s->pipeline.handle),
-                                        s->pipeline.extents, s->pipeline.layouts};
+                                        s->pipeline.extents, s->pipeline.layouts, s->pipeline.vsResources.get()};
         DumpReplacedDraw(s, hash, indexCount, firstIndex, vertexOffset, firstInstance);  // Before: the mod's draw changes nothing it reads.
         replaced = efmidraw::TryReplace(cb, {hash, indexCount, instanceCount, firstInstance, firstIndex, vertexOffset}, state);
     });
@@ -1379,6 +1488,27 @@ uint32_t VertexFormatBytes(VkFormat f) {
     return 0;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* info, const VkAllocationCallbacks* alloc,
+                                                  VkShaderModule* module) {
+    const VkResult r = Device(device)->CreateShaderModule(device, info, alloc, module);
+    if (r == VK_SUCCESS) {
+        Guard("CreateShaderModule", [&] {
+            auto resources = std::make_shared<const std::vector<spirv::Resource>>(spirv::Resources(info->pCode, info->codeSize / 4));
+            std::lock_guard lock(g_moduleMu);
+            (*g_modules)[*module] = std::move(resources);
+        });
+    }
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL DestroyShaderModule(VkDevice device, VkShaderModule module, const VkAllocationCallbacks* alloc) {
+    {
+        std::lock_guard lock(g_moduleMu);
+        g_modules->erase(module);
+    }
+    Device(device)->DestroyShaderModule(device, module, alloc);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
                                                        const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* alloc,
                                                        VkPipeline* pipelines) {
@@ -1397,6 +1527,22 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(VkDevice device, VkPipeli
                 }
             }
             p.handle = pipelines[i];
+            // The vertex shader's buffers: from its module, or its code given in place of one.
+            for (uint32_t st = 0; st < infos[i].stageCount; ++st) {
+                const VkPipelineShaderStageCreateInfo& stage = infos[i].pStages[st];
+                if (stage.stage != VK_SHADER_STAGE_VERTEX_BIT) continue;
+                if (stage.module) {
+                    std::lock_guard moduleLock(g_moduleMu);
+                    const auto it = g_modules->find(stage.module);
+                    if (it != g_modules->end()) p.vsResources = it->second;
+                } else {
+                    for (auto* next = static_cast<const VkBaseInStructure*>(stage.pNext); next; next = next->pNext) {
+                        if (next->sType != VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) continue;
+                        const auto* code = reinterpret_cast<const VkShaderModuleCreateInfo*>(next);
+                        p.vsResources = std::make_shared<const std::vector<spirv::Resource>>(spirv::Resources(code->pCode, code->codeSize / 4));
+                    }
+                }
+            }
             if (const VkPipelineRasterizationStateCreateInfo* raster = infos[i].pRasterizationState) {
                 p.cullMode = raster->cullMode;
                 p.frontFace = raster->frontFace;
@@ -1500,6 +1646,19 @@ VKAPI_ATTR void VKAPI_CALL CmdSetCullMode(VkCommandBuffer cb, VkCullModeFlags mo
     Command(cb)->dynamicCullMode = mode;
     Device(cb)->CmdSetCullMode(cb, mode);
 }
+VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size,
+                                            const void* values) {
+    Guard("CmdPushConstants", [&] {
+        CommandState* s = Command(cb);
+        if (offset < sizeof(s->pushed)) {
+            const uint32_t n = std::min<uint32_t>(size, static_cast<uint32_t>(sizeof(s->pushed)) - offset);
+            memcpy(s->pushed + offset, values, n);
+            s->pushedBytes = std::max(s->pushedBytes, offset + n);
+        }
+    });
+    Device(cb)->CmdPushConstants(cb, layout, stages, offset, size, values);
+}
+
 VKAPI_ATTR void VKAPI_CALL CmdSetCullModeEXT(VkCommandBuffer cb, VkCullModeFlags mode) {
     Command(cb)->dynamicCullMode = mode;
     Device(cb)->CmdSetCullModeEXT(cb, mode);
@@ -1577,6 +1736,7 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
         efmi::OnPresent();
         efmitex::OnPresent();
         efmibones::OnPresent();
+        autofix::OnPresent();
     });
     return Device(queue)->QueuePresentKHR(queue, info);
 }
@@ -1614,6 +1774,8 @@ PFN_vkVoidFunction OwnDeviceFunction(const char* name) {
     EFMI_HOOK(CmdCopyBuffer2KHR)
     EFMI_HOOK(CmdBindIndexBuffer)
     EFMI_HOOK(CreateGraphicsPipelines)
+    EFMI_HOOK(CreateShaderModule)
+    EFMI_HOOK(DestroyShaderModule)
     EFMI_HOOK(DestroyPipeline)
     EFMI_HOOK(CmdBindPipeline)
     EFMI_HOOK(CmdBindVertexBuffers)
@@ -1640,6 +1802,7 @@ PFN_vkVoidFunction OwnDeviceFunction(const char* name) {
     EFMI_HOOK(CmdExecuteCommands)
     EFMI_HOOK(CmdSetCullMode)
     EFMI_HOOK(CmdSetCullModeEXT)
+    EFMI_HOOK(CmdPushConstants)
     EFMI_HOOK(CreateImageView)
     EFMI_HOOK(DestroyImageView)
     EFMI_HOOK(CreateDescriptorSetLayout)
@@ -1705,6 +1868,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkD
     EFMI_NEXT(CmdBindVertexBuffers)
     EFMI_NEXT(CmdBindVertexBuffers2)
     EFMI_NEXT(CreateGraphicsPipelines)
+    EFMI_NEXT(CreateShaderModule)
+    EFMI_NEXT(DestroyShaderModule)
     EFMI_NEXT(DestroyPipeline)
     EFMI_NEXT(CmdBindPipeline)
     EFMI_NEXT(GetBufferMemoryRequirements)
@@ -1740,6 +1905,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice physical, const VkD
     d->ResetVkEvent = reinterpret_cast<PFN_vkResetEvent>(gdpa(*device, "vkResetEvent"));
     d->CmdSetCullMode = reinterpret_cast<PFN_vkCmdSetCullMode>(gdpa(*device, "vkCmdSetCullMode"));
     d->CmdSetCullModeEXT = reinterpret_cast<PFN_vkCmdSetCullMode>(gdpa(*device, "vkCmdSetCullModeEXT"));
+    d->CmdPushConstants = reinterpret_cast<PFN_vkCmdPushConstants>(gdpa(*device, "vkCmdPushConstants"));
     EFMI_NEXT(CmdSetEvent)
     EFMI_NEXT(CreateBufferView)
     EFMI_NEXT(CmdCopyImageToBuffer)

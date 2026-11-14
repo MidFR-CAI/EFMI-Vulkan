@@ -643,6 +643,10 @@ int wmain(int argc, wchar_t** argv) {
         memcpy(static_cast<uint8_t*>(p) + row * 16, value, 16);
     }
     CHECK(MapMemory(device, gameConfigMem, 0, VK_WHOLE_SIZE, 0, &p));
+    // Rows 0 to 3: the object's transform, as every config of the game's has one (rotation
+    // rows, then the position with w 1): the layer leaves draws without one to the game.
+    const float transform[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    memcpy(p, transform, sizeof(transform));
     const uint32_t row5[4] = {2000, 2000, 0, 0x3f800000};  // ..., 1.0f, as the game has it.
     memcpy(static_cast<uint8_t*>(p) + 5 * 16, row5, 16);
     const SetData setData{{sampler, textureView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {gameBones, 0, VK_WHOLE_SIZE}, {gameConfig, 0, 64 << 10}};
@@ -654,6 +658,7 @@ int wmain(int argc, wchar_t** argv) {
     CHECK(MapMemory(device, gameConfig2Mem, 0, VK_WHOLE_SIZE, 0, &p));
     const float position2[4] = {10, 0, 0, 1};
     const uint32_t row5b[4] = {3000, 3000, 0, 0x3f800000};
+    memcpy(p, transform, sizeof(transform));
     memcpy(static_cast<uint8_t*>(p) + 3 * 16, position2, 16);
     memcpy(static_cast<uint8_t*>(p) + 5 * 16, row5b, 16);
     VkDescriptorSet gameSet2;
@@ -726,8 +731,30 @@ int wmain(int argc, wchar_t** argv) {
     size_t modBytes = 0;
     for (size_t i = 0; i < bc7.size(); ++i) modBytes += static_cast<uint8_t*>(p)[i] == 0x5a;
 
+    // Reload (Shift+F10, or R in the EFMIVulkan window): unchanged, the mod is kept; its ini
+    // edited, it is read again.
+    const auto reload = [] {
+        wchar_t name[96];
+        swprintf(name, 96, L"Local\\EFMIVulkan.Reload.%lu", GetCurrentProcessId());  // This process's layer, not a running game's.
+        const HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+        if (!ev) {
+            printf("reload event: error %lu\n", GetLastError());
+            return false;
+        }
+        SetEvent(ev);
+        CloseHandle(ev);
+        Sleep(1500);  // The input thread looks every 30 ms; the reload runs on the job thread.
+        return true;
+    };
+    const bool reloaded = reload();
+    std::ofstream(modsDir + L"\\Efmi\\efmi.ini", std::ios::app) << "; edited\n";
+    const bool reloadedAgain = reload();
+
     Sleep(500);  // The log is written on a background thread.
     const std::string log = ReadAll(scratch + L"\\efmivulkan.log");
+    Expect("reload: the layer takes the reload key", reloaded && reloadedAgain);
+    Expect("reload: an unchanged mod is kept", log.find("mods reloaded: 1 unchanged, 0 read again, 0 gone or changed") != std::string::npos);
+    Expect("reload: an edited mod is read again", log.find("mods reloaded: 0 unchanged, 1 read again, 1 gone or changed") != std::string::npos);
     char text[128];
     Expect("layer loaded and logging", log.find("efmivulkan milestone 2: meshes, textures, merged skeleton") != std::string::npos);
     Expect("layer saw the device", log.find("Vulkan device created") != std::string::npos);

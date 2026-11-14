@@ -167,10 +167,36 @@ bool ToggleMagenta();
 // Sticky swaps: a mod texture that replaced the texture in a slot (per mod component, pass
 // and slot) also replaces an unidentified one there later, of the same format: Unity makes
 // new images when it streams another size in, and those need identifying again.
+// A DX11 texture register's texture (ps-tN), put into the place auto-fix learned register N
+// is on Vulkan, in sets of that layout: what is there is the game's, so no hash names it.
+struct SlotPut {
+    uint32_t set = 0, binding = 0, element = 0;
+    uint64_t layoutSig = 0;
+    int texture = -1;
+};
 struct BindOptions {
     uint64_t drawKey = 0;   // The mod component.
     uint64_t pipeline = 0;  // The pass.
+    const SlotPut* slots = nullptr;
+    uint32_t slotCount = 0;
 };
+
+// A set layout's shape, the same from run to run: each template entry's binding, element,
+// type and count.
+uint64_t LayoutSignature(const std::vector<VkDescriptorUpdateTemplateEntry>& entries);
+
+// For auto-fix: every image a draw's sets hold, where, and its hashes. requestReadback: the
+// ones whose pixels were never seen are read back, to be hashed.
+struct BoundImageInfo {
+    uint32_t set = 0, binding = 0, element = 0;
+    uint64_t layoutSig = 0;
+    ImageDesc image;
+    uint32_t modHash = 0, measured = 0;
+};
+void DescribeBound(const BoundSet* sets, std::vector<BoundImageInfo>* out, bool requestReadback);
+
+// A DDS file's size and Vulkan format, without its pixels.
+bool DdsInfo(const std::wstring& path, uint32_t* width, uint32_t* height, uint32_t* vkFormat);
 uint32_t Bind(VkCommandBuffer cb, const BoundSet* sets, const std::map<uint32_t, int>& replace, const BufferPatch* patches = nullptr,
               uint32_t patchCount = 0, const BindOptions* options = nullptr);
 void Restore(VkCommandBuffer cb, const BoundSet* sets, uint32_t bound);

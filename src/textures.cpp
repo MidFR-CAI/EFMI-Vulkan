@@ -36,6 +36,7 @@ void Matched(uint64_t imageId, uint32_t hash) {
     g_matches.fetch_add(1, std::memory_order_relaxed);
 }
 std::map<uint32_t, uint64_t>* g_unknownFormats = new std::map<uint32_t, uint64_t>();  // VkFormat -> uploads, under g_mu.
+std::unordered_map<uint64_t, uint32_t>* g_measured = new std::unordered_map<uint64_t, uint32_t>();  // Image id -> measured hash, under g_mu.
 
 }  // namespace
 
@@ -43,6 +44,16 @@ void SetTargets(std::set<uint32_t> hashes) {
     std::lock_guard lock(g_mu);
     LogInfo("textures: %zu hashes named by mods", hashes.size());
     *g_targets = std::move(hashes);
+    // A reload (or auto-fix) can name hashes of images that went up already: matched by the
+    // hash their pixels gave.
+    size_t late = 0;
+    for (const auto& [id, hash] : *g_measured) {
+        if (!g_targets->count(hash) || g_matched->count(id)) continue;
+        (*g_matched)[id] = hash;
+        g_seen->insert(hash);
+        ++late;
+    }
+    if (late) LogInfo("textures: %zu images already in the game match hashes the mods name now", late);
 }
 
 void OnImageUpload(uint64_t imageId, uint32_t vkFormat, uint32_t width, uint32_t height, uint32_t mips, const uint8_t* mip0, uint64_t bytes) {
@@ -59,6 +70,7 @@ void OnImageUpload(uint64_t imageId, uint32_t vkFormat, uint32_t width, uint32_t
     const uint32_t data = texhash::DataHash(mip0, expected, width, height, true);
     texhash::Candidate c = texhash::Hash(data, vkFormat, width, height, mips);
     std::lock_guard lock(g_mu);
+    (*g_measured)[imageId] = c.hash;
     const uint64_t level = LevelKey(vkFormat, width, height, data);
     if (!g_targets->count(c.hash)) {
         // A streamed copy of a texture that matched already?
@@ -132,7 +144,19 @@ void OnMipUpload(uint64_t imageId, uint32_t vkFormat, uint32_t mip, uint32_t wid
 
 void OnImageDestroyed(uint64_t imageId) {
     std::lock_guard lock(g_mu);
+    g_measured->erase(imageId);
     if (g_matched->erase(imageId)) g_matchedDestroyed.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint32_t MeasuredHashOf(uint64_t imageId) {
+    std::lock_guard lock(g_mu);
+    const auto it = g_measured->find(imageId);
+    return it == g_measured->end() ? 0 : it->second;
+}
+
+bool EverMatched(uint32_t hash) {
+    std::lock_guard lock(g_mu);
+    return g_seen->count(hash) != 0;
 }
 
 uint32_t HashOf(uint64_t imageId) {

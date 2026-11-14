@@ -20,7 +20,11 @@
 
 #include <cstdint>
 
+#include <vector>
+
+#include "autofix.h"
 #include "efmitex.h"
+#include "spirv.h"
 
 namespace efmivulkan::efmidraw {
 
@@ -79,6 +83,7 @@ struct BindState {
     // bytes past it are not read (padding). Null or 0: as the stride.
     const uint32_t* pipelineExtents = nullptr;
     const AttributeLayout* pipelineLayouts = nullptr;  // kMaxBindings.
+    const std::vector<spirv::Resource>* vsResources = nullptr;  // The buffers its vertex shader declares; null: unknown.
 };
 
 struct Draw {
@@ -94,7 +99,14 @@ void OnPresent();
 // After every part (efmitex, efmibones) has the device: mods load from then on.
 void OnDeviceReady();
 void LogStats();
-void PollKeys();  // From the input thread.
+void PollKeys(bool debugKeys);  // From the input thread. debugKeys: the Alt+M/H/N/B views too.
 bool ToggleEnabled();
+
+// Shift+F10 (job thread): the Mods folder read again. Mods whose ini and files are unchanged
+// are kept as they are; new and changed ones load; removed ones stop drawing.
+void Reload();
+
+// For auto-fix (job thread): every loaded mod, as the analysis needs it.
+std::vector<autofix::ModInfo> DescribeMods();
 
 }  // namespace efmivulkan::efmidraw

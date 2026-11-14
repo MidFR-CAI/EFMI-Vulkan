@@ -136,6 +136,39 @@ static const wchar_t* Elevated(DWORD pid) {
 }
 
 // Whether the layer started logging since the game did: its log is (re)written then.
+// Until the process exits (or ms pass): F in this window has the layer in the game fix mods
+// (Shift+F8 in game), R reload them (Shift+F10). Returns as WaitForSingleObject does.
+static DWORD WaitWithKeys(HANDLE process, DWORD pid, DWORD ms) {
+    const ULONGLONG until = ms == INFINITE ? ~0ull : GetTickCount64() + ms;
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    for (;;) {
+        const DWORD r = WaitForSingleObject(process, 100);
+        if (r != WAIT_TIMEOUT) return r;
+        if (GetTickCount64() >= until) return WAIT_TIMEOUT;
+        DWORD pending = 0;
+        while (input && GetNumberOfConsoleInputEvents(input, &pending) && pending) {
+            INPUT_RECORD rec;
+            DWORD read = 0;
+            if (!ReadConsoleInputW(input, &rec, 1, &read) || !read) break;
+            if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) continue;
+            const wchar_t c = static_cast<wchar_t>(towlower(rec.Event.KeyEvent.uChar.UnicodeChar));
+            const wchar_t* what = c == L'f' ? L"AutoFix" : c == L'r' ? L"Reload" : nullptr;
+            if (!what) continue;
+            wchar_t name[96];
+            swprintf(name, 96, L"Local\\EFMIVulkan.%s.%lu", what, pid);  // The game's own.
+            HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+            if (!ev) {
+                Say(L"The layer is not running in the game yet.");
+                continue;
+            }
+            SetEvent(ev);
+            CloseHandle(ev);
+            if (c == L'f') Say(L"Fixing the mods of the characters on screen; what changed is in autofix.log in %s.", g_logDir.c_str());
+            if (c == L'r') Say(L"Mods reloading in game.");
+        }
+    }
+}
+
 static bool LayerLogged(const FILETIME& since) {
     WIN32_FILE_ATTRIBUTE_DATA data;
     if (!GetFileAttributesExW((g_logDir + L"\\efmivulkan.log").c_str(), GetFileExInfoStandard, &data)) return false;
@@ -190,11 +223,13 @@ int wmain(int argc, wchar_t** argv) {
     DWORD pid = 0;
     while (!(pid = FindProcess())) Sleep(250);
     GetSystemTimeAsFileTime(&started);
-    Say(L"Endfield is running (pid %lu, elevated: %s). Press F10 in game to capture a frame.", pid, Elevated(pid));
+    Say(L"Endfield is running (pid %lu, elevated: %s).", pid, Elevated(pid));
+    Say(L"Keys in game: Shift+F8 fix mods (with the broken characters on screen), Shift+F9 mods on/off, Shift+F10 reload mods.");
+    Say(L"Here: F fixes mods, R reloads them.");
 
     // One check that the loader took the layer, then wait for the game to exit.
     HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
-    const DWORD waited = process ? WaitForSingleObject(process, kLayerCheckMs) : (Sleep(kLayerCheckMs), WAIT_TIMEOUT);
+    const DWORD waited = process ? WaitWithKeys(process, pid, kLayerCheckMs) : (Sleep(kLayerCheckMs), WAIT_TIMEOUT);
     if (waited == WAIT_TIMEOUT) {
         if (LayerLogged(started)) {
             Say(L"The layer is running in the game (efmivulkan.log is being written).");
@@ -203,7 +238,7 @@ int wmain(int argc, wchar_t** argv) {
         }
     }
     if (process) {
-        WaitForSingleObject(process, INFINITE);
+        WaitWithKeys(process, pid, INFINITE);
         CloseHandle(process);
     } else {
         while (FindProcess()) Sleep(1000);

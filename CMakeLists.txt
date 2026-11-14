@@ -29,6 +29,8 @@ add_library(efmivulkan_core STATIC
   src/ini.cpp
   src/efmimod.cpp
   src/texhash.cpp
+  src/autofix_core.cpp
+  src/spirv.cpp
   src/log.cpp)
 target_include_directories(efmivulkan_core PUBLIC src)
 target_compile_definitions(efmivulkan_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -38,6 +40,7 @@ target_compile_options(efmivulkan_core PRIVATE /W4 /utf-8)
 add_library(efmivulkan SHARED
   src/efmivulkan.def
   src/layer.cpp
+  src/autofix.cpp
   src/efmi.cpp
   src/efmidraw.cpp
   src/textures.cpp
@@ -74,6 +77,15 @@ target_link_options(efmivulkan_launch PRIVATE "/MANIFESTUAC:level='requireAdmini
 
 add_executable(test_hash tests/test_hash.cpp)
 target_link_libraries(test_hash PRIVATE efmivulkan_core)
+
+# The SPIR-V reader: which buffers a shader declares.
+add_executable(test_spirv tests/test_spirv.cpp)
+target_link_libraries(test_spirv PRIVATE efmivulkan_core)
+
+# Auto-fix's analysis and ini rewriting.
+add_executable(test_autofix tests/test_autofix.cpp)
+target_compile_options(test_autofix PRIVATE /utf-8)
+target_link_libraries(test_autofix PRIVATE efmivulkan_core)
 
 # Parses every mod in a Mods folder and prints what milestone 2 would draw.
 add_executable(test_parse tests/test_parse.cpp)
