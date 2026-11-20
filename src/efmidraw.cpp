@@ -8,6 +8,7 @@
 #include <cmath>
 #include <atomic>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -106,6 +107,9 @@ struct Runtime {
     std::vector<char> keyDown;  // Input thread only.
     std::atomic<uint64_t> lastDrawFrame{0};
     uint64_t fingerprint = 0;  // Its ini's and files' sizes and times: unchanged, a reload keeps it.
+    // Per merged-skeleton component: it has a LoD entry the mod gives no bone remap for, so its
+    // draws feed efmibones::ObserveLod to learn one. Written once when the buffers load.
+    std::vector<uint8_t> learnLod;
 };
 
 struct Target {
@@ -124,7 +128,7 @@ std::mutex g_reloadMu;  // One load at a time.
 std::mutex g_logMu;
 std::set<std::tuple<const Runtime*, size_t, int>>* g_logged = new std::set<std::tuple<const Runtime*, size_t, int>>();
 
-enum Reason { kGpuPosed, kInstanced, kStride, kNoBuffer, kNoPipeline, kReplaced, kTextures, kOtherBones, kNoBones, kRingFull, kSkeleton, kRecords, kUnidentified, kTrimming, kSlots, kEffectPass };
+enum Reason { kGpuPosed, kInstanced, kStride, kNoBuffer, kNoPipeline, kReplaced, kTextures, kOtherBones, kNoBones, kRingFull, kSkeleton, kRecords, kUnidentified, kTrimming, kSlots, kEffectPass, kLodRemap };
 
 void LogOnce(const Runtime* rt, size_t component, Reason reason, const char* fmt, ...) {
     // Called on every matched draw: each thread skips what it has seen without a lock.
@@ -531,6 +535,38 @@ void MakeSkeleton(Runtime* rt, const std::vector<std::vector<uint8_t>>& data) {
     }
     rt->skeleton.Init(rt->bonesCount, std::move(components));
     rt->skeleton.name = rt->name;
+    // Components with LoD entries: their LoD bone order checked in game (the mod's own remap,
+    // corrected where wrong, or learned where it has none), and saved (lodremaps.ini).
+    rt->learnLod.assign(rt->skeleton.components.size(), 0);
+    size_t missing = 0;
+    for (const EfmiComponent& c : *rt->components.load()) {
+        if (c.lod <= 0 || c.lod >= static_cast<int>(efmibones::kMaxLods) || c.componentId < 0 ||
+            static_cast<size_t>(c.componentId) >= rt->skeleton.components.size()) {
+            continue;
+        }
+        if (!rt->learnLod[c.componentId]) ++missing;
+        rt->learnLod[c.componentId] = 1;
+    }
+    if (missing) {
+        std::ifstream saved(LogDir() + L"\\lodremaps.ini");
+        std::string line;
+        const std::string prefix = rt->name + "|";
+        size_t loaded = 0;
+        while (std::getline(saved, line)) {
+            if (line.rfind(prefix, 0) != 0) continue;
+            unsigned component = 0;
+            int lod = 0, used = 0;
+            if (sscanf_s(line.c_str() + prefix.size(), "%u|%d =%n", &component, &lod, &used) < 2 || !used) continue;
+            std::vector<uint16_t> remap;
+            std::istringstream bones(line.substr(prefix.size() + used));
+            for (unsigned v; bones >> v;) remap.push_back(static_cast<uint16_t>(v));
+            if (remap.empty() || component >= rt->skeleton.components.size()) continue;
+            efmibones::SetLearnedRemap(&rt->skeleton, component, lod, std::move(remap));
+            ++loaded;
+        }
+        LogInfo("%s: %zu components with LoD entries, their bone order checked in game; %zu checked before, from lodremaps.ini", rt->name.c_str(),
+                missing, loaded);
+    }
     rt->hasSkeleton = true;
     LogInfo("%s: merged skeleton of %u bones, %zu components", rt->name.c_str(), rt->bonesCount, rt->skeletonComponents.size());
 }
@@ -1057,6 +1093,16 @@ bool TryReplace(VkCommandBuffer cb, const Draw& draw, const BindState& state) {
             }
             LogOnce(rt, t.component, kEffectPass, "a draw that does not keep its bones the usual way (an effect pass): the game's mesh is drawn, as EFMI's");
             return false;
+        }
+        // A LoD the mod has no bone remap for: the draws of both LoDs teach one (ObserveLod),
+        // and until then this LoD stays the game's. Posed with LoD 0's bone order it explodes.
+        if (skeletal && boneBinding && c.componentId >= 0 && static_cast<size_t>(c.componentId) < rt->learnLod.size() && rt->learnLod[c.componentId]) {
+            efmibones::ObserveLod(&rt->skeleton, static_cast<uint32_t>(c.componentId), c.lod, bones);
+            if (c.gpuPosed && !c.readOnly && c.lod > 0 && !efmibones::HasLodRemap(&rt->skeleton, static_cast<uint32_t>(c.componentId), c.lod)) {
+                LogOnce(rt, t.component, kLodRemap,
+                        "LoD %d has no bone remap in the mod and none learned yet: the game's mesh is drawn until one is (seen up close once)", c.lod);
+                return false;
+            }
         }
         // EFMI's spatial identification of this instance: skipped on its object's first frame,
         // the game's draw until identified, the mod's once identified.

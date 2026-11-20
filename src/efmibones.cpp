@@ -157,7 +157,16 @@ void CaptureImport(Job& j, const uint8_t* bones, uint64_t boneRows) {
     const Skeleton& s = *j.s;
     const Component& c = s.components[j.component];
     const uint32_t current = Row5(j.config.data(), 0), previous = Row5(j.config.data(), 1);
-    const std::vector<uint16_t>* remap = j.lod > 0 && j.lod < static_cast<int>(kMaxLods) && !c.lodRemap[j.lod].empty() ? &c.lodRemap[j.lod] : nullptr;
+    const bool lodded = j.lod > 0 && j.lod < static_cast<int>(kMaxLods);
+    // The remap checked in game (ObserveLod: the mod's own, corrected where wrong, or learned),
+    // else the mod's own as it ships.
+    std::shared_ptr<const std::vector<uint16_t>> learned;
+    if (lodded) {
+        std::lock_guard lock(j.s->mu);
+        const size_t at = size_t(j.component) * kMaxLods + j.lod;
+        if (at < s.learnedRemap.size()) learned = s.learnedRemap[at];
+    }
+    const std::vector<uint16_t>* remap = learned ? learned.get() : lodded && !c.lodRemap[j.lod].empty() ? &c.lodRemap[j.lod] : nullptr;
     const float scale = s.meshScale;
     const uint32_t count = c.offset < s.bones ? std::min(c.count, s.bones - c.offset) : 0;
     j.hasCurrent = current >= kStaticRows;
@@ -411,6 +420,9 @@ void Skeleton::Init(uint32_t boneCount, std::vector<Component> c) {
         in.updateFrame.assign(components.size(), UINT64_MAX);
         in.lodLevel.assign(components.size(), 0);
     }
+    learnedRemap.assign(components.size() * kMaxLods, nullptr);
+    lodSamples.assign(components.size() * kMaxLods, LodSample{});
+    lodLearning.assign(components.size() * kMaxLods, LodLearning{});
 }
 
 void SetDevice(const DeviceFns& fns) { g_fns = fns; }
@@ -539,6 +551,180 @@ bool UsualBones(const BoneBinding& b, uint32_t sampleBones, std::string* why) {
         if (std::fabs(m[3]) > 50.0f || std::fabs(m[7]) > 50.0f || std::fabs(m[11]) > 50.0f) return fail("bone translation past 50 m", m[3], m[7], m[11]);
     }
     return true;
+}
+
+namespace {
+
+// The save file of learned remaps: one line each, "<mod>|<component>|<lod> = <bone> <bone> ...".
+void SaveLearnedRemap(const std::string& mod, uint32_t component, int lod, const std::vector<uint16_t>& remap) {
+    std::string line = mod + "|" + std::to_string(component) + "|" + std::to_string(lod) + " =";
+    for (const uint16_t r : remap) line += " " + std::to_string(r);
+    line += "\r\n";
+    PostJob([line] {
+        FILE* f = nullptr;
+        _wfopen_s(&f, (LogDir() + L"\\lodremaps.ini").c_str(), L"ab");
+        if (!f) return;
+        fwrite(line.data(), 1, line.size(), f);
+        fclose(f);
+    });
+}
+
+// One frame's evidence: each LoD 0 bone's possible places in LoD n's list (the same matrix:
+// both are this frame's pose of the same bone). Many bones share a matrix in a frame (those at
+// rest), so one frame cannot tell them apart: the candidates are narrowed over frames as the
+// object moves (Skeleton::LodLearning). False when too few bones match to trust the pairing.
+bool NarrowCandidates(const std::vector<float>& lod0, const std::vector<float>& lodN, Skeleton::LodLearning& l) {
+    const size_t n0 = lod0.size() / 12, nN = lodN.size() / 12;
+    std::vector<std::vector<uint16_t>> now(n0);
+    size_t matched = 0;
+    for (size_t i = 0; i < n0; ++i) {
+        const float* a = &lod0[i * 12];
+        for (size_t k = 0; k < nN; ++k) {
+            const float* b = &lodN[k * 12];
+            float worst = 0;
+            for (int e = 0; e < 12 && worst < 1e-4f; ++e) worst = std::max(worst, std::fabs(a[e] - b[e]));
+            if (worst < 1e-4f) now[i].push_back(static_cast<uint16_t>(k));
+        }
+        matched += !now[i].empty();
+    }
+    if (matched < std::max<size_t>(1, n0 / 2)) return false;
+    if (l.candidates.size() != n0) l.candidates.assign(n0, {});
+    for (size_t i = 0; i < n0; ++i) {
+        if (now[i].empty()) continue;  // Not in LoD n this frame (a bone it lacks), or a rounding miss.
+        std::vector<uint16_t>& c = l.candidates[i];
+        if (c.empty()) {
+            c = now[i];
+            continue;
+        }
+        std::vector<uint16_t> both;
+        for (uint16_t k : c) {
+            if (std::find(now[i].begin(), now[i].end(), k) != now[i].end()) both.push_back(k);
+        }
+        c = both.empty() ? now[i] : both;  // None in common: the earlier frames were a coincidence.
+    }
+    ++l.frames;
+    l.last = lodN;
+    l.lastZero = lod0;
+    return true;
+}
+
+// The remap, once every LoD 0 bone has one place (or never moved apart from others in many
+// frames: the lowest of them). A bone LoD n lacks takes LoD n's bone nearest to it.
+std::vector<uint16_t> Settle(const Skeleton::LodLearning& l) {
+    constexpr uint32_t kMinFrames = 30, kMaxFrames = 600;
+    if (l.frames < kMinFrames) return {};
+    size_t lastPlace = 0;
+    bool open = false;
+    for (const auto& c : l.candidates) {
+        if (c.size() > 1) open = true;
+        for (uint16_t k : c) lastPlace = std::max<size_t>(lastPlace, k);
+    }
+    if (open && l.frames < kMaxFrames) return {};
+    std::vector<uint16_t> remap(l.candidates.size(), 0);
+    const size_t nN = l.last.size() / 12;
+    for (size_t i = 0; i < l.candidates.size(); ++i) {
+        if (!l.candidates[i].empty()) {
+            remap[i] = *std::min_element(l.candidates[i].begin(), l.candidates[i].end());
+            continue;
+        }
+        const float* a = &l.lastZero[i * 12];
+        float best = FLT_MAX;
+        for (size_t k = 0; k <= lastPlace && k < nN; ++k) {
+            const float* b = &l.last[k * 12];
+            const float dx = a[3] - b[3], dy = a[7] - b[7], dz = a[11] - b[11];
+            if (dx * dx + dy * dy + dz * dz < best) {
+                best = dx * dx + dy * dy + dz * dz;
+                remap[i] = static_cast<uint16_t>(k);
+            }
+        }
+    }
+    return remap;
+}
+
+}  // namespace
+
+void ObserveLod(Skeleton* s, uint32_t component, int lod, const BoneBinding& b) {
+    if (component >= s->components.size() || lod < 0 || lod >= static_cast<int>(kMaxLods) || !b.config || !b.bones) return;
+    const Component& c = s->components[component];
+    // Learned for every LoD, the mod's own remap or not: one the mod ships may be for LoD
+    // meshes of another game version (never used, if the mod had no LoD entries for them).
+    const auto needs = [&](int l) {
+        const size_t at = size_t(component) * kMaxLods + l;
+        return l > 0 && at < s->learnedRemap.size() && !s->learnedRemap[at];
+    };
+    {
+        std::lock_guard lock(s->mu);
+        bool any = false;
+        for (int l = 1; l < static_cast<int>(kMaxLods); ++l) any = any || needs(l);
+        if (!any || (lod > 0 && !needs(lod))) return;
+    }
+    const uint32_t first = Row5(b.config, 0);
+    if (first < kStaticRows || !c.count) return;
+    Skeleton::LodSample sample;
+    sample.frame = g_frame.load(std::memory_order_relaxed);
+    memcpy(sample.position, b.config + 3 * 16, sizeof(sample.position));
+    sample.bones.assign(size_t(c.count) * 12, 0.0f);
+    for (uint32_t i = 0; i < c.count; ++i) {
+        const uint64_t row = uint64_t(first) + 3 + 3ull * i;
+        if (row + 3 > b.boneRows) {
+            sample.bones.resize(size_t(i) * 12);
+            break;
+        }
+        memcpy(&sample.bones[size_t(i) * 12], b.bones + row * 16, 48);
+    }
+    std::lock_guard lock(s->mu);
+    const size_t base = size_t(component) * kMaxLods;
+    if (base + kMaxLods > s->lodSamples.size()) return;
+    s->lodSamples[base + lod] = std::move(sample);
+    const Skeleton::LodSample& zero = s->lodSamples[base];
+    for (int l = 1; l < static_cast<int>(kMaxLods); ++l) {
+        const Skeleton::LodSample& other = s->lodSamples[base + l];
+        if (!needs(l) || zero.frame != other.frame || zero.frame == UINT64_MAX) continue;
+        const float dx = zero.position[0] - other.position[0], dy = zero.position[1] - other.position[1], dz = zero.position[2] - other.position[2];
+        if (dx * dx + dy * dy + dz * dz > 0.25f) continue;  // Two objects: not one draw's LoDs.
+        Skeleton::LodLearning& learning = s->lodLearning[base + l];
+        if (learning.lastFrame == zero.frame || !NarrowCandidates(zero.bones, other.bones, learning)) continue;
+        learning.lastFrame = zero.frame;
+        std::vector<uint16_t> remap = Settle(learning);
+        if (remap.empty()) continue;
+        // The mod's own remap stands for every bone the frames do not prove wrong (its bone
+        // never matched): where bones stayed alike, its choice is as good as any.
+        const std::vector<uint16_t>& own = c.lodRemap[l];
+        size_t differ = 0;
+        for (size_t i = 0; i < remap.size() && i < own.size(); ++i) {
+            const std::vector<uint16_t>& cand = learning.candidates[i];
+            if (cand.empty() || std::find(cand.begin(), cand.end(), own[i]) != cand.end()) {
+                remap[i] = own[i];
+            } else {
+                ++differ;
+            }
+        }
+        if (own.empty()) {
+            LogInfo("merged skeleton: %s component %u: LoD %d's bone order learned in game over %u frames (%zu bones; the mod has no remap for it)",
+                    s->name.c_str(), component, l, learning.frames, remap.size());
+        } else {
+            LogInfo("merged skeleton: %s component %u: LoD %d's bone order checked in game over %u frames; the mod's own remap is wrong for %zu of %zu "
+                    "bones, corrected",
+                    s->name.c_str(), component, l, learning.frames, differ, remap.size());
+        }
+        SaveLearnedRemap(s->name, component, l, remap);
+        s->learnedRemap[base + l] = std::make_shared<const std::vector<uint16_t>>(std::move(remap));
+    }
+}
+
+bool HasLodRemap(Skeleton* s, uint32_t component, int lod) {
+    if (lod <= 0) return true;
+    if (component >= s->components.size() || lod >= static_cast<int>(kMaxLods)) return false;
+    if (!s->components[component].lodRemap[lod].empty()) return true;
+    std::lock_guard lock(s->mu);
+    const size_t at = size_t(component) * kMaxLods + lod;
+    return at < s->learnedRemap.size() && s->learnedRemap[at] != nullptr;
+}
+
+void SetLearnedRemap(Skeleton* s, uint32_t component, int lod, std::vector<uint16_t> remap) {
+    std::lock_guard lock(s->mu);
+    const size_t at = size_t(component) * kMaxLods + lod;
+    if (at < s->learnedRemap.size() && lod > 0) s->learnedRemap[at] = std::make_shared<const std::vector<uint16_t>>(std::move(remap));
 }
 
 void CopyInstance(Skeleton* s, uint32_t from, uint32_t to) {

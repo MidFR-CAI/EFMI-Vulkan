@@ -30,6 +30,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -97,6 +98,26 @@ struct Skeleton {
     std::mutex mu;
     SkeletonInstance instances[kMaxInstances];
     bool fillLogged = false;  // The first fill is logged, to check the bones that arrive.
+    // LoD remaps the mod has none for, learned in game (ObserveLod): per component and LoD
+    // (component * kMaxLods + lod), null until learned. Under mu.
+    std::vector<std::shared_ptr<const std::vector<uint16_t>>> learnedRemap;
+    // The last palette each component's draw had, per LoD, to pair a LoD 0 and a LoD n draw of
+    // one object in one frame. Under mu.
+    struct LodSample {
+        uint64_t frame = UINT64_MAX;
+        float position[3] = {};
+        std::vector<float> bones;  // 12 floats a bone.
+    };
+    std::vector<LodSample> lodSamples;  // component * kMaxLods + lod.
+    // What the paired frames so far say: each LoD 0 bone's possible places in LoD n's list,
+    // narrowed frame by frame (efmibones.cpp, NarrowCandidates). Under mu.
+    struct LodLearning {
+        std::vector<std::vector<uint16_t>> candidates;
+        uint32_t frames = 0;
+        uint64_t lastFrame = UINT64_MAX;
+        std::vector<float> last, lastZero;  // The last pair's LoD n and LoD 0 bones.
+    };
+    std::vector<LodLearning> lodLearning;  // component * kMaxLods + lod.
     std::string name;         // The mod's, for the log.
     void Init(uint32_t boneCount, std::vector<Component> c);
 };
@@ -127,6 +148,18 @@ void Import(VkCommandBuffer cb, Skeleton* s, uint32_t component, int lod, const 
 // otherwise (EFMI's constant-buffer path); read the usual way they are garbage, and the mod's
 // mesh is thrown across the screen. EFMI leaves a draw it cannot pose to the game.
 bool UsualBones(const BoneBinding& b, uint32_t sampleBones, std::string* why = nullptr);
+
+// LoD remaps a mod lacks (EFMI exports one only for the LoDs its author dumped): a LoD's mesh
+// is skinned by a shorter bone list in another order, and posed with LoD 0's order it explodes.
+// When an object draws a component at LoD 0 and at LoD n in the same frame (shadow passes draw
+// LoD 1 while the camera sees LoD 0), each LoD 0 bone is found in LoD n's list by its matrix:
+// the remap, learned. Call for every draw of a component that may need one.
+void ObserveLod(Skeleton* s, uint32_t component, int lod, const BoneBinding& b);
+// The remap a component's LoD is posed with: the mod's own, else a learned one. False when
+// there is neither (the LoD's draw is left to the game until one is learned).
+bool HasLodRemap(Skeleton* s, uint32_t component, int lod);
+// From the save file (lodremaps.ini), when the mod loads.
+void SetLearnedRemap(Skeleton* s, uint32_t component, int lod, std::vector<uint16_t> remap);
 
 // A new spatial slot that is an object the mod knows, moved (a party swap, a dodge): it starts
 // with that slot's bones, not zeros (bones are in the object's own space), and imports its own

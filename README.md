@@ -112,6 +112,10 @@ What Vulkan makes different, for the same result:
   constant-buffer path) is left to the game, as EFMI leaves a mesh it cannot pose.
 - A character that moves at once (a party swap, a dodge) or is unseen for a moment stays the
   mod's, with its bones, instead of being skipped as new and posed with zeros.
+- LoD bone remaps are checked in game: when an object draws a component at LoD 0 and LoD n in
+  one frame, matching bone matrices over many frames give LoD n's bone order. A mod's own
+  remap is corrected where it is wrong, a missing one is learned, and both are saved to
+  `lodremaps.ini`. A LoD with neither stays the game's mesh rather than being posed wrong.
 - Mod vertex buffers in DX11's layout are padded, trimmed or repacked to the strides and
   offsets the Vulkan pipelines read (with tangents computed where the mod has none).
 - Draws under `if vs == N` are kept out of outline passes: DX11 shader hashes do not exist here.
